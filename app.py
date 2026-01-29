@@ -16,9 +16,27 @@ from streamlit_option_menu import option_menu
 # Config
 # ============================================================
 APP_TITLE = "Finanças Pessoais"
-DB_PATH = "financas.db"
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str(BASE_DIR / "financas.db")
 
 TIPOS = ["Despesa", "Receita"]
+
+import os
+import streamlit as st
+from pathlib import Path
+
+db_file = Path(DB_PATH)
+
+with st.sidebar.expander("🔧 Diagnóstico do banco", expanded=False):
+    st.write("Caminho do DB:", str(db_file))
+    st.write("Existe?", db_file.exists())
+    if db_file.exists():
+        st.write("Tamanho (KB):", round(db_file.stat().st_size / 1024, 2))
+    else:
+        st.error("❌ financas.db não encontrado no servidor. Suba o arquivo no GitHub no mesmo nível do app.py.")
+
 
 # ✅ inclui "Amortizado" para cartão (adiantamento)
 STATUS = ["Pago", "Pendente", "Amortizado"]
@@ -2849,3 +2867,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
