@@ -298,12 +298,15 @@ def _pg_copy_app_data(conn: DBConn, src_schema: str, dst_schema: str, clear_dst:
         raise
 
 
-def _auth_update_user_schema(conn: DBConn, user_id: int, schema_name: str) -> None:
+def _auth_update_user_schema(conn: DBConn, user_id: str, schema_name: str) -> None:
+    """Update the user's default schema (tenant) in auth_users."""
     if not _pg_is_valid_ident(schema_name):
         raise ValueError("Schema inválido.")
-    cur = conn.raw.cursor()
-    cur.execute("UPDATE app_users SET schema_name = %s WHERE id = %s", (schema_name, user_id))
-    conn.raw.commit()
+
+    table = "auth_users" if conn.kind == "sqlite" else "public.auth_users"
+    # DBConn.execute adapts '?' -> '%s' for Postgres
+    conn.execute(f"UPDATE {table} SET schema_name = ? WHERE id = ?", (schema_name, user_id))
+
 def _pg_ensure_auth_tables(raw) -> None:
     """Cria as tabelas de autenticação no schema public."""
     with raw.cursor() as cur:
@@ -3375,6 +3378,16 @@ def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
             best_schema, best_n = _pg_find_best_schema_with_data(conn, "transacoes")
 
             with st.sidebar.expander("🛠️ Dados não encontrados", expanded=True):
+                # Diagnóstico rápido (ajuda a entender onde seus dados estão)
+                if conn.kind == "postgres":
+                    try:
+                        cur_count = _pg_rowcount(conn, user_schema, "transacoes")
+                        pub_count = _pg_rowcount(conn, "public", "transacoes")
+                        st.caption(f"Transações no schema atual ({user_schema}): {cur_count} | em public: {pub_count}")
+                    except Exception:
+                        st.caption("(Diagnóstico indisponível)")
+
+
                 st.warning(
                     "Não encontrei transações/investimentos no schema deste usuário. "
                     "Isso normalmente acontece quando o usuário está apontando para um schema vazio."
@@ -3422,7 +3435,7 @@ def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
 
                 with col1:
                     if st.button(f"Vincular meu usuário ao schema '{best_schema}'", use_container_width=True):
-                        _auth_update_user_schema(conn, int(user_id), best_schema)
+                        _auth_update_user_schema(conn, user_id, best_schema)
                         st.session_state["user_schema"] = best_schema
                         _rerun()
 
@@ -3434,7 +3447,7 @@ def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
 
                     if st.button(f"Copiar dados → '{dest_schema}'", use_container_width=True):
                         _pg_copy_app_data(conn, best_schema, dest_schema, clear_dst=True)
-                        _auth_update_user_schema(conn, int(user_id), dest_schema)
+                        _auth_update_user_schema(conn, user_id, dest_schema)
                         st.session_state["user_schema"] = dest_schema
                         _rerun()
 
@@ -3528,6 +3541,9 @@ def main():
 
     # Se o usuário está em um schema vazio, ofereça resgate/cópia dos dados.
     _data_rescue_panel(df_all, inv_all)
+
+    if USE_POSTGRES and (df_all is not None and df_all.empty) and (inv_all is not None and inv_all.empty):
+        st.warning("Não encontrei dados no schema atual. Abra na barra lateral o painel **🆘 Resgatar meus dados** para localizar e copiar/vincular seus dados existentes (ex.: do schema public).")
 
     months = available_months(df_all, inv_all=inv_all, future_months=12, past_months=18, mode=mode, cutoff_day=cutoff_day)
     st.session_state["_months_list"] = months
