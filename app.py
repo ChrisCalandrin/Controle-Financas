@@ -836,7 +836,7 @@ def db_conn(schema: Optional[str] = None):
             cur.execute(f'SET search_path TO "{target_schema}", public')
         raw.commit()
 
-        yield DBConn(raw, "postgres")
+        yield DBConn(raw, "pg")
 
     except Exception:
         raw.rollback()
