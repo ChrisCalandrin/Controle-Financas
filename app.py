@@ -41,6 +41,14 @@ def _get_secret(key: str):
 DATABASE_URL = os.getenv('DATABASE_URL') or _get_secret('DATABASE_URL')
 USE_POSTGRES = bool(DATABASE_URL and str(DATABASE_URL).lower().startswith('postgres'))
 
+def _rerun():
+    """Compat: Streamlit mudou de experimental_rerun() para rerun()."""
+    fn = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+    if fn is None:
+        raise RuntimeError("Streamlit rerun() indisponível nesta versão.")
+    fn()
+
+
 def _adapt_sql(sql: str) -> str:
     # SQLite usa '?', Postgres (psycopg2) usa '%s'
     return sql.replace('?', '%s') if USE_POSTGRES else sql
@@ -314,7 +322,7 @@ def auth_gate() -> bool:
                 }
                 st.session_state["user_schema"] = st.session_state["auth_user"]["schema_name"]
                 st.success("Login realizado! Carregando...")
-                st.experimental_rerun()
+                _rerun()
 
     with col2:
         st.subheader("Criar conta")
@@ -2250,7 +2258,7 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                     try:
                         insert_transacao(d, desc, str(categoria), tipo, valor_f, pagamento, status)
                         st.success("Lançamento salvo!")
-                        st.rerun()
+                        _rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar: {e}")
 
@@ -2360,7 +2368,7 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                         update_transacao(payload)
 
                     st.success(f"Atualizado: {len(changed_ids)} lançamento(s).")
-                    st.rerun()
+                    _rerun()
 
             except Exception as e:
                 st.error(f"Falha ao salvar alterações: {e}")
@@ -2374,7 +2382,7 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                 else:
                     n = delete_transacoes(to_delete)
                     st.success(f"Excluídos: {n} lançamento(s).")
-                    st.rerun()
+                    _rerun()
             except Exception as e:
                 st.error(f"Falha ao excluir: {e}")
 
@@ -2497,7 +2505,7 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
                         insert_cc_compra(d_compra, str(desc), str(cat), tipo_compra, float(v), parcelas_db)
                         ensure_cc_generated(horizon_months=24)
                         st.success("Compra cadastrada! Parcelas/recorrências foram geradas.")
-                        st.rerun()
+                        _rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar compra: {e}")
 
@@ -2555,7 +2563,7 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
                 try:
                     set_cc_compra_ativo(int(id_sel), 0 if ativo_now == 1 else 1)
                     st.success("Atualizado.")
-                    st.rerun()
+                    _rerun()
                 except Exception as e:
                     st.error(f"Falha: {e}")
         with c_act3:
@@ -2636,7 +2644,7 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
                                     observacao=str(obs),
                                 )
                                 st.success(f"Amortizado: {amort_qtd} parcela(s). Pago agora: {brl(valor_pago)}")
-                                st.rerun()
+                                _rerun()
                             except Exception as e:
                                 st.error(f"Falha ao amortizar: {e}")
 
@@ -2697,7 +2705,7 @@ def screen_planejamento(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_da
                     try:
                         upsert_orcamento(str(cat), float(teto))
                         st.success("Teto salvo!")
-                        st.rerun()
+                        _rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar teto: {e}")
 
@@ -2747,7 +2755,7 @@ def screen_planejamento(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_da
 
                 if changed or to_del:
                     st.success("Orçamentos atualizados!")
-                    st.rerun()
+                    _rerun()
                 else:
                     st.info("Nenhuma alteração detectada.")
 
@@ -2846,7 +2854,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
                 try:
                     upsert_invest_config(float(aporte_planejado), float(cdi_anual), float(pct_cdi))
                     st.success("Configurações salvas!")
-                    st.rerun()
+                    _rerun()
                 except Exception as e:
                     st.error(f"Falha ao salvar: {e}")
 
@@ -2979,7 +2987,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
                             )
 
                         st.success("Movimento registrado!")
-                        st.rerun()
+                        _rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar: {e}")
 
@@ -3082,7 +3090,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
 
                     if changed:
                         st.success(f"Atualizado: {len(changed)} movimento(s).")
-                        st.rerun()
+                        _rerun()
                     else:
                         st.info("Nenhuma alteração detectada.")
 
@@ -3098,7 +3106,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
                     else:
                         n = delete_invest_aportes(to_delete)
                         st.success(f"Excluídos: {n} movimento(s).")
-                        st.rerun()
+                        _rerun()
                 except Exception as e:
                     st.error(f"Falha ao excluir: {e}")
 
@@ -3218,7 +3226,7 @@ def main():
             if st.button('Sair (logout)'):
                 for k in ['auth_user','user_schema','_user_schema_ready']:
                     st.session_state.pop(k, None)
-                st.experimental_rerun()
+                _rerun()
         else:
             st.markdown('**Usuário:** (não logado)')
         st.markdown("### 💼 Finanças")
@@ -3241,7 +3249,7 @@ def main():
                 st.session_state.analysis_mode = mode_new
                 st.session_state.budget_cutoff_day = int(cutoff_new)
                 st.success("Período salvo!")
-                st.rerun()
+                _rerun()
 
         selected = option_menu(
             None,
