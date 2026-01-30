@@ -85,7 +85,7 @@ class DBConn:
 
 def read_sql_df(sql: str, conn: DBConn, params=()):
     """pd.read_sql_query compatível com SQLite e Postgres."""
-    return read_sql_df(_adapt_sql(sql), conn.raw, params=params or ())
+    return pd.read_sql_query(_adapt_sql(sql), conn.raw, params=params or ())
 
 
 TIPOS = ["Despesa", "Receita"]
