@@ -51,6 +51,11 @@ class DBConn:
         self.con = con
         self.backend = backend  # 'sqlite' | 'postgres'
 
+
+    @property
+    def kind(self):
+        # compat: código antigo usa conn.kind
+        return self.backend
     @property
     def raw(self):
         return self.con
