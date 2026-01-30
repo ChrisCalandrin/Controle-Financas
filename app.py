@@ -54,52 +54,54 @@ def _adapt_sql(sql: str) -> str:
     return sql.replace('?', '%s') if USE_POSTGRES else sql
 
 class DBConn:
-    """Wrapper para unificar SQLite e Postgres no código existente."""
-    def __init__(self, con, backend: str):
-        self.con = con
-        self.backend = backend  # 'sqlite' | 'postgres'
+    """Wrapper para unificar SQLite e Postgres.
 
+    - conn.raw  -> conexão DB-API (sqlite3.Connection ou psycopg2.Connection)
+    - conn.kind -> 'sqlite' ou 'pg'
+    - conn.schema -> schema atual (Postgres) ou None (SQLite)
+    """
 
-    @property
-    def kind(self):
-        # compat: código antigo usa conn.kind
-        return self.backend
-    @property
-    def raw(self):
-        return self.con
+    def __init__(self, raw, kind: str, schema: str | None = None):
+        self.raw = raw
+        self.kind = kind  # 'sqlite' | 'pg'
+        self.schema = schema
 
-    def execute(self, sql: str, params=()):
-        if self.backend == 'postgres':
-            cur = self.con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(_adapt_sql(sql), params or ())
-            return cur
-        return self.con.execute(sql, params or ())
+    def cursor(self):
+        return self.raw.cursor()
 
-    def executemany(self, sql: str, seq_params):
-        if self.backend == 'postgres':
-            cur = self.con.cursor()
-            cur.executemany(_adapt_sql(sql), seq_params)
-            return cur
-        return self.con.executemany(sql, seq_params)
+    def execute(self, sql: str, params=None):
+        sql2 = _adapt_sql(sql) if self.kind == "pg" else sql
+        cur = self.raw.cursor()
+        cur.execute(sql2, params or ())
+        return cur
+
+    def executemany(self, sql: str, seq_of_params):
+        sql2 = _adapt_sql(sql) if self.kind == "pg" else sql
+        cur = self.raw.cursor()
+        cur.executemany(sql2, seq_of_params)
+        return cur
 
     def commit(self):
-        return self.con.commit()
+        try:
+            self.raw.commit()
+        except Exception:
+            pass
 
     def rollback(self):
         try:
-            return self.con.rollback()
+            self.raw.rollback()
         except Exception:
-            return None
+            pass
 
     def close(self):
-        return self.con.close()
-
-    def cursor(self, *args, **kwargs):
-        return self.con.cursor(*args, **kwargs)
+        try:
+            self.raw.close()
+        except Exception:
+            pass
 
     def __getattr__(self, item):
-        return getattr(self.con, item)
-
+        # Proxy de atributos não implementados explicitamente (ex.: row_factory no sqlite)
+        return getattr(self.raw, item)
 # =============================================================================
 # Autenticação (Login + Multi-usuário por schema)
 # - auth tables ficam no schema PUBLIC
@@ -139,6 +141,169 @@ def _verify_password(password: str, hashed: str) -> bool:
     except Exception:
         return False
 
+
+# ============================================================
+# Postgres helpers — localizar dados existentes e copiar/vincular
+# ============================================================
+
+def _pg_is_valid_ident(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", name or ""))
+
+
+def _pg_qident(name: str) -> str:
+    """Quote seguro para identificadores já validados."""
+    if not _pg_is_valid_ident(name):
+        raise ValueError(f"Identificador inválido: {name!r}")
+    return f'"{name}"'
+
+
+def _pg_table_exists(conn: DBConn, schema: str, table: str) -> bool:
+    try:
+        cur = conn.raw.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+            LIMIT 1
+            """,
+            (schema, table),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _pg_rowcount(conn: DBConn, schema: str, table: str) -> int | None:
+    """Retorna COUNT(*) ou None se não der para contar."""
+    try:
+        if not _pg_is_valid_ident(schema) or not _pg_is_valid_ident(table):
+            return None
+        cur = conn.raw.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM {_pg_qident(schema)}.{_pg_qident(table)}")
+        return int(cur.fetchone()[0])
+    except Exception:
+        return None
+
+
+def _pg_find_schemas_with_table(conn: DBConn, table: str) -> list[str]:
+    """Lista schemas que possuem a tabela informada."""
+    try:
+        cur = conn.raw.cursor()
+        cur.execute(
+            """
+            SELECT table_schema
+            FROM information_schema.tables
+            WHERE table_name = %s
+              AND table_schema NOT IN ('pg_catalog','information_schema')
+            ORDER BY table_schema
+            """,
+            (table,),
+        )
+        return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def _pg_find_best_schema_with_data(conn: DBConn, table: str = "transacoes") -> tuple[str | None, int]:
+    """Procura o schema com mais linhas na tabela (padrão: transacoes)."""
+    best_schema, best_n = None, 0
+    for schema in _pg_find_schemas_with_table(conn, table):
+        n = _pg_rowcount(conn, schema, table)
+        if n is None:
+            continue
+        if n > best_n:
+            best_schema, best_n = schema, n
+    return best_schema, best_n
+
+
+def _pg_reset_id_sequence(conn: DBConn, schema: str, table: str, id_col: str = "id") -> None:
+    """Ajusta sequência SERIAL/IDENTITY para não colidir IDs."""
+    try:
+        if not (_pg_is_valid_ident(schema) and _pg_is_valid_ident(table) and _pg_is_valid_ident(id_col)):
+            return
+        cur = conn.raw.cursor()
+        # pg_get_serial_sequence retorna NULL se não houver sequence
+        cur.execute(
+            f"""
+            SELECT setval(
+                pg_get_serial_sequence(%s, %s),
+                COALESCE((SELECT MAX({_pg_qident(id_col)}) FROM {_pg_qident(schema)}.{_pg_qident(table)}), 0) + 1,
+                false
+            )
+            """,
+            (f"{schema}.{table}", id_col),
+        )
+        conn.raw.commit()
+    except Exception:
+        # Se a tabela não tiver sequence (ou for UUID), ignoramos
+        try:
+            conn.raw.rollback()
+        except Exception:
+            pass
+
+
+def _pg_copy_table_data(conn: DBConn, src_schema: str, dst_schema: str, table: str, clear_dst: bool = False) -> None:
+    if not (_pg_is_valid_ident(src_schema) and _pg_is_valid_ident(dst_schema) and _pg_is_valid_ident(table)):
+        raise ValueError("Schema/tabela inválidos.")
+
+    cur = conn.raw.cursor()
+
+    # garante schema destino
+    cur.execute(f'CREATE SCHEMA IF NOT EXISTS {_pg_qident(dst_schema)}')
+
+    # garante tabela destino (clonando estrutura)
+    if not _pg_table_exists(conn, dst_schema, table):
+        cur.execute(
+            f'CREATE TABLE {_pg_qident(dst_schema)}.{_pg_qident(table)} (LIKE {_pg_qident(src_schema)}.{_pg_qident(table)} INCLUDING ALL)'
+        )
+
+    if clear_dst:
+        cur.execute(f"TRUNCATE TABLE {_pg_qident(dst_schema)}.{_pg_qident(table)} RESTART IDENTITY CASCADE")
+
+    # copia
+    cur.execute(
+        f"INSERT INTO {_pg_qident(dst_schema)}.{_pg_qident(table)} SELECT * FROM {_pg_qident(src_schema)}.{_pg_qident(table)}"
+    )
+
+
+def _pg_copy_app_data(conn: DBConn, src_schema: str, dst_schema: str, clear_dst: bool = False) -> None:
+    """Copia TODAS as tabelas do app (KNOWN_APP_TABLES) de src_schema para dst_schema."""
+    cur = conn.raw.cursor()
+    try:
+        # valida
+        if not (_pg_is_valid_ident(src_schema) and _pg_is_valid_ident(dst_schema)):
+            raise ValueError("Schema inválido.")
+
+        # checa se src existe e tem a tabela principal
+        if not _pg_table_exists(conn, src_schema, "transacoes"):
+            raise RuntimeError(f"Não encontrei transacoes em '{src_schema}'.")
+
+        # copia por tabela
+        for t in KNOWN_APP_TABLES:
+            if _pg_table_exists(conn, src_schema, t):
+                _pg_copy_table_data(conn, src_schema, dst_schema, t, clear_dst=clear_dst)
+
+        conn.raw.commit()
+
+        # reseta sequences (onde houver)
+        for t in KNOWN_APP_TABLES:
+            _pg_reset_id_sequence(conn, dst_schema, t, "id")
+
+    except Exception:
+        try:
+            conn.raw.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def _auth_update_user_schema(conn: DBConn, user_id: int, schema_name: str) -> None:
+    if not _pg_is_valid_ident(schema_name):
+        raise ValueError("Schema inválido.")
+    cur = conn.raw.cursor()
+    cur.execute("UPDATE app_users SET schema_name = %s WHERE id = %s", (schema_name, user_id))
+    conn.raw.commit()
 def _pg_ensure_auth_tables(raw) -> None:
     """Cria as tabelas de autenticação no schema public."""
     with raw.cursor() as cur:
@@ -3185,6 +3350,97 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
 # ============================================================
 
 
+
+def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
+    """Se não houver dados no schema do usuário, tenta encontrar onde os dados estão.
+
+    Isso resolve o caso clássico: você migrou dados para um schema (ex.: public),
+    criou login (schema por usuário), e o usuário entrou num schema vazio.
+    """
+    if not USE_POSTGRES:
+        return
+
+    user_id = st.session_state.get("user_id")
+    user_schema = st.session_state.get("user_schema") or "public"
+    if not user_id:
+        return
+
+    # se tem qualquer dado, não faz nada
+    if (df_all is not None and len(df_all) > 0) or (inv_all is not None and len(inv_all) > 0):
+        return
+
+    # abre conexão "public" (onde ficam app_users e onde podemos inspecionar schemas)
+    try:
+        with db_conn("public") as conn:
+            best_schema, best_n = _pg_find_best_schema_with_data(conn, "transacoes")
+
+            with st.sidebar.expander("🛠️ Dados não encontrados", expanded=True):
+                st.warning(
+                    "Não encontrei transações/investimentos no schema deste usuário. "
+                    "Isso normalmente acontece quando o usuário está apontando para um schema vazio."
+                )
+
+                # Diagnóstico rápido
+                st.caption(f"Seu usuário está configurado para schema: `{user_schema}`")
+                n_here = _pg_rowcount(conn, user_schema, "transacoes") if _pg_table_exists(conn, user_schema, "transacoes") else None
+                if n_here is None:
+                    st.write("Tabela `transacoes` não encontrada neste schema.")
+                else:
+                    st.write(f"Linhas em `{user_schema}.transacoes`: **{n_here}**")
+
+                if not best_schema or best_n == 0:
+                    st.error(
+                        "Também não encontrei dados em outros schemas. "
+                        "Verifique se o `DATABASE_URL` do Streamlit está apontando para o mesmo Supabase "
+                        "onde você migrou o `financas.db`."
+                    )
+                    st.info("Dica: no Streamlit Cloud, vá em **Manage app → Settings → Secrets** e confira o valor de `DATABASE_URL`.")
+                    return
+
+                if best_schema == user_schema:
+                    st.info("O schema correto já está selecionado. Se ainda assim aparece vazio, pode ser apenas o mês/ano selecionado.")
+                    return
+
+                st.success(f"Encontrei **{best_n}** transações em `{best_schema}.transacoes`.")
+
+                # lista schemas com contagem (top 8)
+                try:
+                    schemas = _pg_find_schemas_with_table(conn, "transacoes")
+                    counts = []
+                    for s in schemas:
+                        c = _pg_rowcount(conn, s, "transacoes") or 0
+                        if c > 0:
+                            counts.append((s, c))
+                    counts.sort(key=lambda x: x[1], reverse=True)
+                    if counts:
+                        st.caption("Schemas com dados (top):")
+                        st.write(pd.DataFrame(counts[:8], columns=["schema", "linhas_transacoes"]))
+                except Exception:
+                    pass
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    if st.button(f"Vincular meu usuário ao schema '{best_schema}'", use_container_width=True):
+                        _auth_update_user_schema(conn, int(user_id), best_schema)
+                        st.session_state["user_schema"] = best_schema
+                        _rerun()
+
+                with col2:
+                    # Se o usuário já está no public e ele está vazio, criamos um schema próprio e copiamos.
+                    dest_schema = user_schema
+                    if dest_schema == "public":
+                        dest_schema = f"u_{user_id}"
+
+                    if st.button(f"Copiar dados → '{dest_schema}'", use_container_width=True):
+                        _pg_copy_app_data(conn, best_schema, dest_schema, clear_dst=True)
+                        _auth_update_user_schema(conn, int(user_id), dest_schema)
+                        st.session_state["user_schema"] = dest_schema
+                        _rerun()
+
+    except Exception as e:
+        # não quebra o app por causa disso
+        st.sidebar.error(f"Falha ao diagnosticar dados no Supabase: {e}")
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="💰")
     st.markdown(CSS, unsafe_allow_html=True)
@@ -3270,8 +3526,32 @@ def main():
     df_all = fetch_transacoes()
     inv_all = fetch_invest_aportes()
 
+    # Se o usuário está em um schema vazio, ofereça resgate/cópia dos dados.
+    _data_rescue_panel(df_all, inv_all)
+
     months = available_months(df_all, inv_all=inv_all, future_months=12, past_months=18, mode=mode, cutoff_day=cutoff_day)
     st.session_state["_months_list"] = months
+
+    # Auto-ajuste: quando o app abre (ou após login), ir para o mês mais recente que possui dados.
+    if not st.session_state.get("period_autofit_done"):
+        try:
+            months_with_data = set()
+            if df_all is not None and (not df_all.empty) and ("data" in df_all.columns):
+                dts = pd.to_datetime(df_all["data"], errors="coerce")
+                months_with_data.update(dts.dropna().dt.strftime("%Y-%m").unique().tolist())
+            if inv_all is not None and (not inv_all.empty) and ("data" in inv_all.columns):
+                dts = pd.to_datetime(inv_all["data"], errors="coerce")
+                months_with_data.update(dts.dropna().dt.strftime("%Y-%m").unique().tolist())
+            # escolhe o mês mais recente que existe na lista de meses disponíveis
+            candidates = [m for m in months if m in months_with_data]
+            if candidates:
+                best_month = candidates[-1]
+                st.session_state["selected_month"] = best_month
+                st.session_state["selected_year"] = int(best_month.split("-")[0])
+        except Exception:
+            pass
+        st.session_state["period_autofit_done"] = True
+
     scope, yyyy_mm, year = top_bar(months, mode, cutoff_day)
 
     if selected == "Dashboard":
