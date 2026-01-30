@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+
+# Postgres (Supabase) — opcional
+try:
+    import psycopg2  # pip install psycopg2-binary
+    import psycopg2.extras
+except Exception:  # pragma: no cover
+    psycopg2 = None
+
 from contextlib import contextmanager
 from datetime import date
 import calendar
@@ -16,27 +25,70 @@ from streamlit_option_menu import option_menu
 # Config
 # ============================================================
 APP_TITLE = "Finanças Pessoais"
-from pathlib import Path
+DB_PATH = "financas.db"
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = str(BASE_DIR / "financas.db")
+def _get_secret(key: str):
+    try:
+        return st.secrets.get(key)  # Streamlit Cloud
+    except Exception:
+        return None
+
+# Se existir DATABASE_URL, usa Supabase/Postgres; senão, usa SQLite local (financas.db)
+DATABASE_URL = os.getenv('DATABASE_URL') or _get_secret('DATABASE_URL')
+USE_POSTGRES = bool(DATABASE_URL and str(DATABASE_URL).lower().startswith('postgres'))
+
+def _adapt_sql(sql: str) -> str:
+    # SQLite usa '?', Postgres (psycopg2) usa '%s'
+    return sql.replace('?', '%s') if USE_POSTGRES else sql
+
+class DBConn:
+    """Wrapper para unificar SQLite e Postgres no código existente."""
+    def __init__(self, con, backend: str):
+        self.con = con
+        self.backend = backend  # 'sqlite' | 'postgres'
+
+    @property
+    def raw(self):
+        return self.con
+
+    def execute(self, sql: str, params=()):
+        if self.backend == 'postgres':
+            cur = self.con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(_adapt_sql(sql), params or ())
+            return cur
+        return self.con.execute(sql, params or ())
+
+    def executemany(self, sql: str, seq_params):
+        if self.backend == 'postgres':
+            cur = self.con.cursor()
+            cur.executemany(_adapt_sql(sql), seq_params)
+            return cur
+        return self.con.executemany(sql, seq_params)
+
+    def commit(self):
+        return self.con.commit()
+
+    def rollback(self):
+        try:
+            return self.con.rollback()
+        except Exception:
+            return None
+
+    def close(self):
+        return self.con.close()
+
+    def cursor(self, *args, **kwargs):
+        return self.con.cursor(*args, **kwargs)
+
+    def __getattr__(self, item):
+        return getattr(self.con, item)
+
+def read_sql_df(sql: str, conn: DBConn, params=()):
+    """pd.read_sql_query compatível com SQLite e Postgres."""
+    return read_sql_df(_adapt_sql(sql), conn.raw, params=params or ())
+
 
 TIPOS = ["Despesa", "Receita"]
-
-import os
-import streamlit as st
-from pathlib import Path
-
-db_file = Path(DB_PATH)
-
-with st.sidebar.expander("🔧 Diagnóstico do banco", expanded=False):
-    st.write("Caminho do DB:", str(db_file))
-    st.write("Existe?", db_file.exists())
-    if db_file.exists():
-        st.write("Tamanho (KB):", round(db_file.stat().st_size / 1024, 2))
-    else:
-        st.error("❌ financas.db não encontrado no servidor. Suba o arquivo no GitHub no mesmo nível do app.py.")
-
 
 # ✅ inclui "Amortizado" para cartão (adiantamento)
 STATUS = ["Pago", "Pendente", "Amortizado"]
@@ -278,25 +330,62 @@ def filter_df_by_year(df: pd.DataFrame, date_col: str, year: int, mode: str, cut
 
 
 @contextmanager
-def db_conn(path: str = DB_PATH):
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def db_conn():
+    """Abre uma conexão.
+    - Local: SQLite (financas.db)
+    - Online: Supabase/Postgres (DATABASE_URL)
+    """
+    if USE_POSTGRES:
+        if psycopg2 is None:
+            raise RuntimeError('psycopg2 não instalado. Rode: pip install psycopg2-binary')
+        db_url = str(DATABASE_URL)
+        if "sslmode=" not in db_url:
+            db_url += ("&" if "?" in db_url else "?") + "sslmode=require"
+        con = psycopg2.connect(db_url)
+        wrapped = DBConn(con, 'postgres')
+        try:
+            yield wrapped
+            con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            con.close()
+    else:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        wrapped = DBConn(con, 'sqlite')
+        try:
+            yield wrapped
+            con.commit()
+        finally:
+            con.close()
 
-
-def _table_cols(conn: sqlite3.Connection, table: str) -> set:
+def _table_cols(conn: DBConn, table: str) -> set[str]:
+    """Retorna o conjunto de colunas de uma tabela."""
+    if USE_POSTGRES:
+        cur = conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            ORDER BY ordinal_position
+            """.strip(),
+            (table,),
+        )
+        return {r['column_name'] for r in cur.fetchall()}
+    # SQLite
     cur = conn.execute(f"PRAGMA table_info({table})")
-    return {r["name"] for r in cur.fetchall()}
-
+    return {r['name'] for r in cur.fetchall()}
 
 def init_db() -> None:
+    # No Supabase/Postgres, o schema é criado/migrado pelo supabase_bootstrap.py (uma vez).
+    if USE_POSTGRES:
+        return
+
     with db_conn() as conn:
         cur = conn.cursor()
 
@@ -464,7 +553,7 @@ def upsert_app_config(budget_mode: str, cutoff_day: int) -> None:
 
 def fetch_transacoes() -> pd.DataFrame:
     with db_conn() as conn:
-        df = pd.read_sql_query(
+        df = read_sql_df(
             """
             SELECT
                 id, data, descricao, categoria, tipo, valor, pagamento, status,
@@ -496,7 +585,7 @@ def fetch_transacoes() -> pd.DataFrame:
 
 def fetch_orcamentos() -> pd.DataFrame:
     with db_conn() as conn:
-        df = pd.read_sql_query("SELECT categoria, valor_teto FROM orcamentos", conn)
+        df = read_sql_df("SELECT categoria, valor_teto FROM orcamentos", conn)
 
     if df.empty:
         return df
@@ -571,9 +660,9 @@ def delete_transacoes(ids: Iterable[int]) -> int:
     ids = [int(i) for i in ids if str(i).strip().isdigit()]
     if not ids:
         return 0
+
     with db_conn() as conn:
-        cur = conn.cursor()
-        cur.executemany("DELETE FROM transacoes WHERE id = ?", [(i,) for i in ids])
+        cur = conn.executemany("DELETE FROM transacoes WHERE id = ?", [(i,) for i in ids])
         return cur.rowcount
 
 
@@ -623,7 +712,7 @@ def delete_orcamento(categoria: str) -> None:
 
 def fetch_cc_compras() -> pd.DataFrame:
     with db_conn() as conn:
-        df = pd.read_sql_query(
+        df = read_sql_df(
             """
             SELECT id, data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo, created_at
             FROM cc_compras
@@ -677,7 +766,7 @@ def set_cc_compra_ativo(cc_compra_id: int, ativo: int) -> None:
 def fetch_cc_amortizacoes(cc_compra_id: Optional[int] = None) -> pd.DataFrame:
     with db_conn() as conn:
         if cc_compra_id is None:
-            df = pd.read_sql_query(
+            df = read_sql_df(
                 """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
                 FROM cc_amortizacoes
@@ -686,7 +775,7 @@ def fetch_cc_amortizacoes(cc_compra_id: Optional[int] = None) -> pd.DataFrame:
                 conn,
             )
         else:
-            df = pd.read_sql_query(
+            df = read_sql_df(
                 """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
                 FROM cc_amortizacoes
@@ -850,7 +939,7 @@ def amortizar_compra(
     desconto = max(0.0, float(desconto))
 
     with db_conn() as conn:
-        df = pd.read_sql_query(
+        df = read_sql_df(
             """
             SELECT id, data, descricao, valor, cc_parcela_num, cc_parcela_total
             FROM transacoes
@@ -981,12 +1070,12 @@ def fetch_invest_aportes() -> pd.DataFrame:
     with db_conn() as conn:
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
-            df = pd.read_sql_query(
+            df = read_sql_df(
                 "SELECT id, data, produto, tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
                 conn,
             )
         else:
-            df = pd.read_sql_query(
+            df = read_sql_df(
                 "SELECT id, data, produto, 'Aporte' as tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
                 conn,
             )
@@ -1085,9 +1174,9 @@ def delete_invest_aportes(ids: Iterable[int]) -> int:
     ids = [int(i) for i in ids if str(i).strip().isdigit()]
     if not ids:
         return 0
+
     with db_conn() as conn:
-        cur = conn.cursor()
-        cur.executemany("DELETE FROM investimentos_aportes WHERE id = ?", [(i,) for i in ids])
+        cur = conn.executemany("DELETE FROM investimentos_aportes WHERE id = ?", [(i,) for i in ids])
         return cur.rowcount
 
 
@@ -2764,18 +2853,10 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
     final_plan = float(y_plan[-1])
     delta = final_plan - final_real
 
-
-    months = int(years) * 12
-    aportes_real = principal + (real_pmt * months)
-    aportes_plan = principal + (planned_pmt * months)
-    juros_real = final_real - aportes_real
-    juros_plan = final_plan - aportes_plan
     st.markdown(
         "<div class='panel'>"
         f"<div style='font-size:1.15rem;font-weight:800'>Em {years} ano(s):</div>"
         f"<div class='small-muted' style='margin-top:6px'>Real: <b>{brl(final_real)}</b> &nbsp;|&nbsp; Planejado: <b>{brl(final_plan)}</b> &nbsp;|&nbsp; Diferença: <b>{brl(delta)}</b></div>"
-        f"<div class='small-muted' style='margin-top:6px'>Aportado (Real/Plan.): <b>{brl(aportes_real)}</b> &nbsp;|&nbsp; <b>{brl(aportes_plan)}</b></div>"
-        f"<div class='small-muted' style='margin-top:6px'>Juros (Real/Plan.): <b>{brl(juros_real)}</b> &nbsp;|&nbsp; <b>{brl(juros_plan)}</b></div>"
         f"<div class='small-muted' style='margin-top:6px'>Taxa usada: {(annual_rate*100):.2f}% a.a. (CDI {cfg['cdi_anual']:.2f}% * {cfg['pct_cdi']:.0f}%)</div>"
         "</div>",
         unsafe_allow_html=True,
@@ -2867,4 +2948,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
