@@ -38,8 +38,18 @@ def _get_secret(key: str):
         return None
 
 # Se existir DATABASE_URL, usa Supabase/Postgres; senão, usa SQLite local (financas.db)
-DATABASE_URL = os.getenv('DATABASE_URL') or _get_secret('DATABASE_URL')
-USE_POSTGRES = bool(DATABASE_URL and str(DATABASE_URL).lower().startswith('postgres'))
+# Se existir DATABASE_URL, usa Supabase/Postgres; senão, usa SQLite local (financas.db)
+_raw_dburl = os.getenv("DATABASE_URL") or _get_secret("DATABASE_URL")
+DATABASE_URL = ""
+if _raw_dburl is not None:
+    DATABASE_URL = str(_raw_dburl).replace("\r", "").replace("\n", "").strip()
+    # remove aspas acidentais (ex: quando cola o valor com quotes)
+    DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'").strip()
+    # às vezes o usuário cola 'DATABASE_URL=postgresql://...'
+    if DATABASE_URL.lower().startswith("database_url"):
+        DATABASE_URL = DATABASE_URL.split("=", 1)[-1].strip().strip('"').strip("'").strip()
+
+USE_POSTGRES = bool(DATABASE_URL and DATABASE_URL.lower().startswith(("postgres://", "postgresql://")))
 
 def _rerun():
     """Compat: Streamlit mudou de experimental_rerun() para rerun()."""
@@ -3515,6 +3525,7 @@ def main():
             u = st.session_state['auth_user']
             st.markdown(f"**Usuário:** {u.get('display_name') or u.get('email')}")
             st.caption(f"Schema: `{st.session_state.get('user_schema','public')}`")
+            st.caption(f"DB: {'Supabase/Postgres' if USE_POSTGRES else 'SQLite local'}")
             if st.button('Sair (logout)'):
                 for k in ['auth_user','user_schema','_user_schema_ready']:
                     st.session_state.pop(k, None)
