@@ -13,6 +13,9 @@ except Exception:  # pragma: no cover
 from contextlib import contextmanager
 from datetime import date
 import calendar
+import uuid
+import bcrypt
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -83,6 +86,274 @@ class DBConn:
     def __getattr__(self, item):
         return getattr(self.con, item)
 
+# =============================================================================
+# Autenticação (Login + Multi-usuário por schema)
+# - auth tables ficam no schema PUBLIC
+# - dados do app ficam no schema do usuário (search_path: "<user_schema>", public)
+# =============================================================================
+
+AUTH_USERS_TABLE = "auth_users"
+AUTH_ATTEMPTS_TABLE = "auth_login_attempts"
+
+MAX_LOGIN_ATTEMPTS = 6
+LOCK_MINUTES = 15
+
+# Tabelas do app que serão clonadas para cada usuário (se existirem no public)
+KNOWN_APP_TABLES = [
+    "transacoes",
+    "orcamentos",
+    "cc_compras",
+    "cc_amortizacoes",
+    "investimentos_aportes",
+    "investimentos_config",
+    "app_config",
+    "app_settings",
+    "lancamentos_fixos",
+]
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _hash_password(password: str) -> str:
+    pw = password.encode("utf-8")
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(pw, salt).decode("utf-8")
+
+def _verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+def _pg_ensure_auth_tables(raw) -> None:
+    """Cria as tabelas de autenticação no schema public."""
+    with raw.cursor() as cur:
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS public.{AUTH_USERS_TABLE} (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            display_name TEXT,
+            schema_name TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """)
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS public.{AUTH_ATTEMPTS_TABLE} (
+            email TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TIMESTAMPTZ
+        );
+        """)
+    raw.commit()
+
+def _pg_public_tables(raw) -> List[str]:
+    with raw.cursor() as cur:
+        cur.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        """)
+        rows = cur.fetchall()
+    # RealDictCursor -> dict
+    if rows and isinstance(rows[0], dict):
+        return [r["table_name"] for r in rows]
+    return [r[0] for r in rows]
+
+def _pg_ensure_user_schema_and_tables(raw, schema_name: str) -> None:
+    """Cria o schema do usuário + clona tabelas do app a partir do public."""
+    if schema_name == "public":
+        return
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", schema_name):
+        raise RuntimeError(f"Schema inválido: {schema_name}")
+
+    existing_public = set(_pg_public_tables(raw))
+    tables_to_clone = [t for t in KNOWN_APP_TABLES if t in existing_public]
+
+    with raw.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}";')
+        for t in tables_to_clone:
+            # Clona a estrutura (defaults/constraints). Os IDs podem continuar usando as sequences do public (ok).
+            cur.execute(
+                f'CREATE TABLE IF NOT EXISTS "{schema_name}"."{t}" (LIKE public."{t}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS);'
+            )
+    raw.commit()
+
+
+def _query_one(conn: DBConn, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
+    cur = conn.execute(sql, params)
+    row = cur.fetchone()
+    if not row:
+        return None
+    if isinstance(row, dict):
+        return row
+    # sqlite3.Row
+    if hasattr(row, "keys"):
+        return {k: row[k] for k in row.keys()}
+    # fallback
+    return {"value": row[0]}
+
+def _auth_get_attempts(conn: DBConn, email: str) -> Tuple[int, Optional[datetime]]:
+    row = _query_one(conn, 
+        f"SELECT attempts, locked_until FROM public.{AUTH_ATTEMPTS_TABLE} WHERE lower(email)=lower(?)",
+        (email,),
+    )
+    if not row:
+        return 0, None
+    # locked_until pode vir como datetime ou string
+    locked = row.get("locked_until")
+    if isinstance(locked, str):
+        try:
+            locked = datetime.fromisoformat(locked)
+        except Exception:
+            locked = None
+    return int(row.get("attempts") or 0), locked
+
+def _auth_set_attempts(conn: DBConn, email: str, attempts: int, locked_until: Optional[datetime]) -> None:
+    # UPSERT compatível via SELECT WHERE NOT EXISTS
+    conn.execute(
+        f"""
+        INSERT INTO public.{AUTH_ATTEMPTS_TABLE} (email, attempts, locked_until)
+        SELECT ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM public.{AUTH_ATTEMPTS_TABLE} WHERE lower(email)=lower(?))
+        """,
+        (email, attempts, locked_until, email),
+    )
+    conn.execute(
+        f"""
+        UPDATE public.{AUTH_ATTEMPTS_TABLE}
+        SET attempts = ?, locked_until = ?
+        WHERE lower(email)=lower(?)
+        """,
+        (attempts, locked_until, email),
+    )
+
+def _auth_clear_attempts(conn: DBConn, email: str) -> None:
+    conn.execute(f"DELETE FROM public.{AUTH_ATTEMPTS_TABLE} WHERE lower(email)=lower(?)", (email,))
+
+def _auth_get_user(conn: DBConn, email: str) -> Optional[Dict[str, Any]]:
+    row = _query_one(conn, 
+        f"""
+        SELECT id, email, password_hash, display_name, schema_name
+        FROM public.{AUTH_USERS_TABLE}
+        WHERE lower(email)=lower(?)
+        """,
+        (email,),
+    )
+    return row
+
+def _auth_users_count(conn: DBConn) -> int:
+    row = _query_one(conn, f"SELECT COUNT(*) AS n FROM public.{AUTH_USERS_TABLE}", ())
+    if not row:
+        return 0
+    return int(row.get("n") or 0)
+
+def _auth_create_user(conn: DBConn, email: str, password: str, display_name: str, schema_name: str) -> Dict[str, Any]:
+    user_id = str(uuid.uuid4())
+    pw_hash = _hash_password(password)
+
+    conn.execute(
+        f"""
+        INSERT INTO public.{AUTH_USERS_TABLE} (id, email, password_hash, display_name, schema_name)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, email, pw_hash, display_name, schema_name),
+    )
+    return {"id": user_id, "email": email, "display_name": display_name, "schema_name": schema_name}
+
+def auth_gate() -> bool:
+    """Mostra tela de login/cadastro e retorna True quando houver usuário logado."""
+    if st.session_state.get("auth_user"):
+        return True
+
+    st.title("🔐 Entrar no Controle de Finanças")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.subheader("Login")
+        email = st.text_input("E-mail", key="login_email")
+        password = st.text_input("Senha", type="password", key="login_password")
+        if st.button("Entrar", type="primary"):
+            if not email or not password:
+                st.error("Preencha e-mail e senha.")
+                st.stop()
+
+            with db_conn("public") as conn:
+                attempts, locked_until = _auth_get_attempts(conn, email)
+                if locked_until and locked_until > _now_utc():
+                    mins = int((locked_until - _now_utc()).total_seconds() // 60) + 1
+                    st.error(f"Muitas tentativas. Tente novamente em ~{mins} minuto(s).")
+                    st.stop()
+
+                user = _auth_get_user(conn, email)
+                if not user or not _verify_password(password, user["password_hash"]):
+                    attempts = attempts + 1
+                    lock = None
+                    if attempts >= MAX_LOGIN_ATTEMPTS:
+                        lock = _now_utc() + timedelta(minutes=LOCK_MINUTES)
+                    _auth_set_attempts(conn, email, attempts, lock)
+                    conn.commit()
+                    st.error("E-mail ou senha inválidos.")
+                    st.stop()
+
+                # sucesso
+                _auth_clear_attempts(conn, email)
+                conn.commit()
+
+                st.session_state["auth_user"] = {
+                    "id": user["id"],
+                    "email": user["email"],
+                    "display_name": user.get("display_name") or "",
+                    "schema_name": user.get("schema_name") or "public",
+                }
+                st.session_state["user_schema"] = st.session_state["auth_user"]["schema_name"]
+                st.success("Login realizado! Carregando...")
+                st.experimental_rerun()
+
+    with col2:
+        st.subheader("Criar conta")
+        name = st.text_input("Nome (como vai aparecer)", key="signup_name")
+        email2 = st.text_input("E-mail (novo)", key="signup_email")
+        pw1 = st.text_input("Senha (nova)", type="password", key="signup_pw1")
+        pw2 = st.text_input("Confirmar senha", type="password", key="signup_pw2")
+
+        with db_conn("public") as conn:
+            users_count = _auth_users_count(conn)
+
+        usar_dados_existentes = False
+        if users_count == 0 and USE_POSTGRES:
+            usar_dados_existentes = st.checkbox(
+                "Este é meu usuário principal (usar os dados que já existem no Supabase)",
+                value=True,
+                help="Marque para NÃO criar um schema separado. Assim você continua vendo seus dados atuais.",
+            )
+
+        if st.button("Criar conta", key="signup_btn"):
+            if not name or not email2 or not pw1 or not pw2:
+                st.error("Preencha todos os campos.")
+                st.stop()
+            if pw1 != pw2:
+                st.error("As senhas não conferem.")
+                st.stop()
+            if len(pw1) < 6:
+                st.error("Use uma senha com pelo menos 6 caracteres.")
+                st.stop()
+
+            schema_name = "public" if usar_dados_existentes else f"u_{uuid.uuid4().hex[:16]}"
+
+            with db_conn("public") as conn:
+                if _auth_get_user(conn, email2):
+                    st.error("Esse e-mail já está cadastrado.")
+                    st.stop()
+
+                # Se for um novo usuário (schema separado), garante schema + tabelas
+                if USE_POSTGRES and schema_name != "public":
+                    _pg_ensure_user_schema_and_tables(conn.raw, schema_name)
+
+                user = _auth_create_user(conn, email2, pw1, name, schema_name)
+                conn.commit()
+
+            st.success("Conta criada! Você já pode fazer login.")
 def read_sql_df(sql: str, conn: DBConn, params=()):
     """pd.read_sql_query compatível com SQLite e Postgres."""
     return pd.read_sql_query(_adapt_sql(sql), conn.raw, params=params or ())
@@ -330,57 +601,89 @@ def filter_df_by_year(df: pd.DataFrame, date_col: str, year: int, mode: str, cut
 
 
 @contextmanager
-def db_conn():
-    """Abre uma conexão.
-    - Local: SQLite (financas.db)
-    - Online: Supabase/Postgres (DATABASE_URL)
+def db_conn(schema: Optional[str] = None):
     """
-    if USE_POSTGRES:
-        if psycopg2 is None:
-            raise RuntimeError('psycopg2 não instalado. Rode: pip install psycopg2-binary')
-        db_url = str(DATABASE_URL)
-        if "sslmode=" not in db_url:
-            db_url += ("&" if "?" in db_url else "?") + "sslmode=require"
-        con = psycopg2.connect(db_url)
-        wrapped = DBConn(con, 'postgres')
+    Conexão única para SQLite (local) ou Postgres/Supabase (cloud).
+    - Se `schema` for None e existir usuário logado, usa o schema do usuário.
+    - Se `schema` for informado, força o schema (ex.: 'public' para autenticação).
+    """
+    if not USE_POSTGRES:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
         try:
-            yield wrapped
-            con.commit()
-        except Exception:
-            try:
-                con.rollback()
-            except Exception:
-                pass
-            raise
+            yield DBConn(conn, "sqlite")
         finally:
-            con.close()
-    else:
-        con = sqlite3.connect(DB_PATH)
-        con.row_factory = sqlite3.Row
-        wrapped = DBConn(con, 'sqlite')
-        try:
-            yield wrapped
-            con.commit()
-        finally:
-            con.close()
+            conn.close()
+        return
 
-def _table_cols(conn: DBConn, table: str) -> set[str]:
-    """Retorna o conjunto de colunas de uma tabela."""
-    if USE_POSTGRES:
-        cur = conn.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ?
-            ORDER BY ordinal_position
-            """.strip(),
-            (table,),
+    # --- Postgres/Supabase ---
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    pg_url = None
+    # 1) Streamlit secrets (Cloud)
+    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+        pg_url = st.secrets["DATABASE_URL"]
+    # 2) Variável de ambiente (local)
+    if not pg_url:
+        pg_url = os.environ.get("DATABASE_URL")
+
+    if not pg_url:
+        raise RuntimeError(
+            "DATABASE_URL não encontrado. Adicione em Streamlit Secrets (Cloud) "
+            "ou como variável de ambiente no seu PC."
         )
-        return {r['column_name'] for r in cur.fetchall()}
-    # SQLite
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return {r['name'] for r in cur.fetchall()}
 
+    raw = psycopg2.connect(pg_url, cursor_factory=RealDictCursor, sslmode="require")
+    raw.autocommit = False
+
+    target_schema = schema or st.session_state.get("user_schema") or "public"
+
+    try:
+        # Garante auth tables no public (uma vez por sessão)
+        if not st.session_state.get("_auth_tables_ready", False):
+            _pg_ensure_auth_tables(raw)
+            st.session_state["_auth_tables_ready"] = True
+
+        # Se não for public, garante schema do usuário + tabelas base clonadas
+        if target_schema != "public" and st.session_state.get("_user_schema_ready") != target_schema:
+            _pg_ensure_user_schema_and_tables(raw, target_schema)
+            st.session_state["_user_schema_ready"] = target_schema
+
+        # Ajusta search_path (schema do usuário primeiro; depois public para auth)
+        with raw.cursor() as cur:
+            if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", target_schema):
+                raise RuntimeError(f"Schema inválido: {target_schema}")
+            cur.execute(f'SET search_path TO "{target_schema}", public')
+        raw.commit()
+
+        yield DBConn(raw, "postgres")
+
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+def _table_cols(conn: DBConn, table: str) -> List[str]:
+    if conn.kind == "sqlite":
+        sql = "SELECT name FROM pragma_table_info(?)"
+        cur = conn.execute(sql, (table,))
+        rows = cur.fetchall()
+        return [r["name"] if isinstance(r, dict) else r[0] for r in rows]
+
+    # Postgres: usa o schema atual (primeiro do search_path) em vez de fixar 'public'
+    sql = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = ?
+    ORDER BY ordinal_position
+    """
+    cur = conn.execute(sql, (table,))
+    rows = cur.fetchall()
+    if rows and isinstance(rows[0], dict):
+        return [r["column_name"] for r in rows]
+    return [r[0] for r in rows]
 def init_db() -> None:
     # No Supabase/Postgres, o schema é criado/migrado pelo supabase_bootstrap.py (uma vez).
     if USE_POSTGRES:
@@ -2873,8 +3176,19 @@ def main():
     st.markdown(CSS, unsafe_allow_html=True)
 
     init_db()
-    generate_mock_data()
     ensure_state()
+
+    # Login (no Supabase) — bloqueia o acesso sem senha
+    if USE_POSTGRES:
+        if not auth_gate():
+            return
+    else:
+        # SQLite local: por enquanto deixamos sem login (mais simples).
+        pass
+
+    # Dados de exemplo somente no SQLite local (evita inserir dados fake no Supabase)
+    if not USE_POSTGRES:
+        generate_mock_data()
 
     # carrega config persistida 1x por sessão
     if not st.session_state._period_cfg_loaded:
@@ -2889,6 +3203,18 @@ def main():
     ensure_cc_generated(horizon_months=24)
 
     with st.sidebar:
+
+        # --- Sessão / Usuário ---
+        if st.session_state.get('auth_user'):
+            u = st.session_state['auth_user']
+            st.markdown(f"**Usuário:** {u.get('display_name') or u.get('email')}")
+            st.caption(f"Schema: `{st.session_state.get('user_schema','public')}`")
+            if st.button('Sair (logout)'):
+                for k in ['auth_user','user_schema','_user_schema_ready']:
+                    st.session_state.pop(k, None)
+                st.experimental_rerun()
+        else:
+            st.markdown('**Usuário:** (não logado)')
         st.markdown("### 💼 Finanças")
 
         with st.expander("🧾 Período / mês de orçamento", expanded=False):
@@ -2925,7 +3251,7 @@ def main():
             },
         )
         st.markdown("---")
-        st.caption("Dados locais em SQLite (financas.db)")
+    st.caption('Dados no Supabase (Postgres)' if USE_POSTGRES else 'Dados locais em SQLite (financas.db)')
 
     df_all = fetch_transacoes()
     inv_all = fetch_invest_aportes()
