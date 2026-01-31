@@ -38,18 +38,8 @@ def _get_secret(key: str):
         return None
 
 # Se existir DATABASE_URL, usa Supabase/Postgres; senão, usa SQLite local (financas.db)
-# Se existir DATABASE_URL, usa Supabase/Postgres; senão, usa SQLite local (financas.db)
-_raw_dburl = os.getenv("DATABASE_URL") or _get_secret("DATABASE_URL")
-DATABASE_URL = ""
-if _raw_dburl is not None:
-    DATABASE_URL = str(_raw_dburl).replace("\r", "").replace("\n", "").strip()
-    # remove aspas acidentais (ex: quando cola o valor com quotes)
-    DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'").strip()
-    # às vezes o usuário cola 'DATABASE_URL=postgresql://...'
-    if DATABASE_URL.lower().startswith("database_url"):
-        DATABASE_URL = DATABASE_URL.split("=", 1)[-1].strip().strip('"').strip("'").strip()
-
-USE_POSTGRES = bool(DATABASE_URL and DATABASE_URL.lower().startswith(("postgres://", "postgresql://")))
+DATABASE_URL = os.getenv('DATABASE_URL') or _get_secret('DATABASE_URL')
+USE_POSTGRES = bool(DATABASE_URL and str(DATABASE_URL).lower().startswith('postgres'))
 
 def _rerun():
     """Compat: Streamlit mudou de experimental_rerun() para rerun()."""
@@ -136,28 +126,6 @@ KNOWN_APP_TABLES = [
     "app_settings",
     "lancamentos_fixos",
 ]
-
-
-# ============================================================
-# SQL helpers (safe schema-qualified tables for Postgres)
-# ============================================================
-IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-def _safe_ident(name: str) -> str:
-    name = (name or "").strip()
-    if not IDENT_RE.fullmatch(name):
-        raise ValueError(f"Invalid SQL identifier: {name!r}")
-    return name
-
-def _qident(name: str) -> str:
-    return f'"{_safe_ident(name)}"'
-
-def tbl(conn: "DBConn", table: str, schema: str | None = None) -> str:
-    """Return a table name, schema-qualified for Postgres, plain for SQLite."""
-    if getattr(conn, "kind", None) == "sqlite":
-        return _safe_ident(table)
-    sch = schema or st.session_state.get("user_schema") or "public"
-    return f"{_qident(sch)}.{_qident(table)}"
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -330,15 +298,12 @@ def _pg_copy_app_data(conn: DBConn, src_schema: str, dst_schema: str, clear_dst:
         raise
 
 
-def _auth_update_user_schema(conn: DBConn, user_id: str, schema_name: str) -> None:
-    """Update the user's default schema (tenant) in auth_users."""
+def _auth_update_user_schema(conn: DBConn, user_id: int, schema_name: str) -> None:
     if not _pg_is_valid_ident(schema_name):
         raise ValueError("Schema inválido.")
-
-    table = "auth_users" if conn.kind == "sqlite" else "public.auth_users"
-    # DBConn.execute adapts '?' -> '%s' for Postgres
-    conn.execute(f"UPDATE {table} SET schema_name = ? WHERE id = ?", (schema_name, user_id))
-
+    cur = conn.raw.cursor()
+    cur.execute("UPDATE app_users SET schema_name = %s WHERE id = %s", (schema_name, user_id))
+    conn.raw.commit()
 def _pg_ensure_auth_tables(raw) -> None:
     """Cria as tabelas de autenticação no schema public."""
     with raw.cursor() as cur:
@@ -878,23 +843,22 @@ def db_conn(schema: Optional[str] = None):
         raise
     finally:
         raw.close()
-def _table_cols(conn: DBConn, table: str, schema: str | None = None) -> List[str]:
+def _table_cols(conn: DBConn, table: str) -> List[str]:
     if conn.kind == "sqlite":
         sql = "SELECT name FROM pragma_table_info(?)"
         cur = conn.execute(sql, (table,))
         rows = cur.fetchall()
         return [r["name"] if isinstance(r, dict) else r[0] for r in rows]
 
-    # Postgres: não depender do search_path; usar schema ativo (ou informado).
-    schema_used = (schema or st.session_state.get("user_schema") or current_schema(conn) or "public").strip()
+    # Postgres: usa o schema atual (primeiro do search_path) em vez de fixar 'public'
     sql = """
     SELECT column_name
     FROM information_schema.columns
-    WHERE table_schema = ?
+    WHERE table_schema = current_schema()
       AND table_name = ?
     ORDER BY ordinal_position
     """
-    cur = conn.execute(sql, (schema_used, table))
+    cur = conn.execute(sql, (table,))
     rows = cur.fetchall()
     if rows and isinstance(rows[0], dict):
         return [r["column_name"] for r in rows]
@@ -1018,7 +982,7 @@ def init_db() -> None:
         inv_cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" not in inv_cols:
             cur.execute("ALTER TABLE investimentos_aportes ADD COLUMN tipo TEXT;")
-            cur.execute(f"UPDATE {tbl(conn, 'investimentos_aportes')} SET tipo = 'Aporte' WHERE tipo IS NULL OR TRIM(tipo) = ''; ")
+            cur.execute("UPDATE investimentos_aportes SET tipo = 'Aporte' WHERE tipo IS NULL OR TRIM(tipo) = '';")
 
         # índices
         cur.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_data ON transacoes(data);")
@@ -1072,11 +1036,11 @@ def upsert_app_config(budget_mode: str, cutoff_day: int) -> None:
 def fetch_transacoes() -> pd.DataFrame:
     with db_conn() as conn:
         df = read_sql_df(
-            f"""
+            """
             SELECT
                 id, data, descricao, categoria, tipo, valor, pagamento, status,
                 origem, cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
-            FROM {tbl(conn, "transacoes")}
+            FROM transacoes
             """,
             conn,
         )
@@ -1103,7 +1067,7 @@ def fetch_transacoes() -> pd.DataFrame:
 
 def fetch_orcamentos() -> pd.DataFrame:
     with db_conn() as conn:
-        df = read_sql_df(f"SELECT categoria, valor_teto FROM {tbl(conn, 'orcamentos')}", conn)
+        df = read_sql_df("SELECT categoria, valor_teto FROM orcamentos", conn)
 
     if df.empty:
         return df
@@ -1125,8 +1089,8 @@ def insert_transacao(
     data_str = pd.Timestamp(data).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
-            f"""
-            INSERT INTO {tbl(conn, "transacoes")} (data, descricao, categoria, tipo, valor, pagamento, status)
+            """
+            INSERT INTO transacoes (data, descricao, categoria, tipo, valor, pagamento, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (data_str, descricao.strip(), categoria.strip(), tipo, float(valor), pagamento, status),
@@ -1150,8 +1114,8 @@ def insert_transacao_extra(
     data_str = pd.Timestamp(data).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
-            f"""
-            INSERT INTO {tbl(conn, "transacoes")} (
+            """
+            INSERT INTO transacoes (
                 data, descricao, categoria, tipo, valor, pagamento, status,
                 origem, cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
             )
@@ -1180,15 +1144,15 @@ def delete_transacoes(ids: Iterable[int]) -> int:
         return 0
 
     with db_conn() as conn:
-        cur = conn.executemany(f"DELETE FROM {tbl(conn, 'transacoes')} WHERE id = ?", [(i,) for i in ids])
+        cur = conn.executemany("DELETE FROM transacoes WHERE id = ?", [(i,) for i in ids])
         return cur.rowcount
 
 
 def update_transacao(row: Dict) -> None:
     with db_conn() as conn:
         conn.execute(
-            f"""
-            UPDATE {tbl(conn, "transacoes")}
+            """
+            UPDATE transacoes
             SET data = ?, descricao = ?, categoria = ?, tipo = ?, valor = ?, pagamento = ?, status = ?
             WHERE id = ?
             """,
@@ -1209,8 +1173,8 @@ def upsert_orcamento(categoria: str, valor_teto: float) -> None:
     categoria = categoria.strip()
     with db_conn() as conn:
         conn.execute(
-            f"""
-            INSERT INTO {tbl(conn, "orcamentos")} (categoria, valor_teto)
+            """
+            INSERT INTO orcamentos (categoria, valor_teto)
             VALUES (?, ?)
             ON CONFLICT(categoria) DO UPDATE SET valor_teto = excluded.valor_teto
             """,
@@ -1220,7 +1184,7 @@ def upsert_orcamento(categoria: str, valor_teto: float) -> None:
 
 def delete_orcamento(categoria: str) -> None:
     with db_conn() as conn:
-        conn.execute(f"DELETE FROM {tbl(conn, 'orcamentos')} WHERE categoria = ?", (categoria,))
+        conn.execute("DELETE FROM orcamentos WHERE categoria = ?", (categoria,))
 
 
 # ============================================================
@@ -1231,9 +1195,9 @@ def delete_orcamento(categoria: str) -> None:
 def fetch_cc_compras() -> pd.DataFrame:
     with db_conn() as conn:
         df = read_sql_df(
-            f"""
+            """
             SELECT id, data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo, created_at
-            FROM {tbl(conn, "cc_compras")}
+            FROM cc_compras
             ORDER BY id DESC
             """,
             conn,
@@ -1261,8 +1225,8 @@ def insert_cc_compra(
     data_str = pd.Timestamp(data_compra).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
-            f"""
-            INSERT INTO {tbl(conn, "cc_compras")} (data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo)
+            """
+            INSERT INTO cc_compras (data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo)
             VALUES (?, ?, ?, ?, ?, ?, 1)
             """,
             (
@@ -1278,25 +1242,25 @@ def insert_cc_compra(
 
 def set_cc_compra_ativo(cc_compra_id: int, ativo: int) -> None:
     with db_conn() as conn:
-        conn.execute(f"UPDATE {tbl(conn, 'cc_compras')} SET ativo = ? WHERE id = ?", (int(ativo), int(cc_compra_id)))
+        conn.execute("UPDATE cc_compras SET ativo = ? WHERE id = ?", (int(ativo), int(cc_compra_id)))
 
 
 def fetch_cc_amortizacoes(cc_compra_id: Optional[int] = None) -> pd.DataFrame:
     with db_conn() as conn:
         if cc_compra_id is None:
             df = read_sql_df(
-                f"""
+                """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
-                FROM {tbl(conn, "cc_amortizacoes")}
+                FROM cc_amortizacoes
                 ORDER BY id DESC
                 """,
                 conn,
             )
         else:
             df = read_sql_df(
-                f"""
+                """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
-                FROM {tbl(conn, "cc_amortizacoes")}
+                FROM cc_amortizacoes
                 WHERE cc_compra_id = ?
                 ORDER BY id DESC
                 """,
@@ -1326,8 +1290,8 @@ def insert_cc_amortizacao(
     data_str = pd.Timestamp(data_).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
-            f"""
-            INSERT INTO {tbl(conn, "cc_amortizacoes")} (cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao)
+            """
+            INSERT INTO cc_amortizacoes (cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1345,9 +1309,9 @@ def insert_cc_amortizacao(
 def _cc_transacao_exists(cc_compra_id: int, cc_parcela_num: Optional[int], ref_month: str) -> bool:
     with db_conn() as conn:
         cur = conn.execute(
-            f"""
+            """
             SELECT 1
-            FROM {tbl(conn, "transacoes")}
+            FROM transacoes
             WHERE cc_compra_id = ?
               AND (cc_parcela_num IS ? OR cc_parcela_num = ?)
               AND ref_month = ?
@@ -1452,15 +1416,15 @@ def amortizar_compra(
     1) Marca N parcelas futuras como "Amortizado"
     2) Cria uma transação 'Despesa' agora (pagamento adiantado) NÃO no 'Crédito'
     3) Registra em cc_amortizacoes
-    f"""
+    """
     parcelas_amortizar = max(1, int(parcelas_amortizar))
     desconto = max(0.0, float(desconto))
 
     with db_conn() as conn:
         df = read_sql_df(
-            f"""
+            """
             SELECT id, data, descricao, valor, cc_parcela_num, cc_parcela_total
-            FROM {tbl(conn, "transacoes")}
+            FROM transacoes
             WHERE cc_compra_id = ?
               AND pagamento = 'Crédito'
               AND tipo = 'Despesa'
@@ -1483,7 +1447,7 @@ def amortizar_compra(
     valor_pago = round(valor_bruto - desconto, 2)
 
     with db_conn() as conn:
-        conn.executemany(f"UPDATE {tbl(conn, 'transacoes')} SET status = 'Amortizado' WHERE id = ?", [(int(i),) for i in amort_ids])
+        conn.executemany("UPDATE transacoes SET status = 'Amortizado' WHERE id = ?", [(int(i),) for i in amort_ids])
 
     desc_base = str(take.iloc[0]["descricao"]) if not take.empty else "Compra no cartão"
     insert_transacao_extra(
@@ -1558,7 +1522,7 @@ def _sum_liquido(df: pd.DataFrame) -> float:
 def fetch_invest_config() -> Dict[str, float]:
     with db_conn() as conn:
         row = conn.execute(
-            f"SELECT aporte_planejado, cdi_anual, pct_cdi FROM {tbl(conn, 'investimentos_config')} WHERE id = 1"
+            "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config WHERE id = 1"
         ).fetchone()
     if not row:
         return {"aporte_planejado": 0.0, "cdi_anual": 0.0, "pct_cdi": 100.0}
@@ -1572,8 +1536,8 @@ def fetch_invest_config() -> Dict[str, float]:
 def upsert_invest_config(aporte_planejado: float, cdi_anual: float, pct_cdi: float) -> None:
     with db_conn() as conn:
         conn.execute(
-            f"""
-            INSERT INTO {tbl(conn, "investimentos_config")} (id, aporte_planejado, cdi_anual, pct_cdi)
+            """
+            INSERT INTO investimentos_config (id, aporte_planejado, cdi_anual, pct_cdi)
             VALUES (1, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 aporte_planejado = excluded.aporte_planejado,
@@ -1589,12 +1553,12 @@ def fetch_invest_aportes() -> pd.DataFrame:
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
             df = read_sql_df(
-                f"SELECT id, data, produto, tipo, valor, observacao FROM {tbl(conn, 'investimentos_aportes')} ORDER BY date(data) DESC, id DESC",
+                "SELECT id, data, produto, tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
                 conn,
             )
         else:
             df = read_sql_df(
-                f"SELECT id, data, produto, 'Aporte' as tipo, valor, observacao FROM {tbl(conn, 'investimentos_aportes')} ORDER BY date(data) DESC, id DESC",
+                "SELECT id, data, produto, 'Aporte' as tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
                 conn,
             )
 
@@ -1618,16 +1582,16 @@ def insert_invest_movimento(d: date, produto: str, tipo: str, valor_abs: float, 
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
             conn.execute(
-                f"""
-                INSERT INTO {tbl(conn, "investimentos_aportes")} (data, produto, tipo, valor, observacao)
+                """
+                INSERT INTO investimentos_aportes (data, produto, tipo, valor, observacao)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (data_str, (produto or "").strip(), tipo, float(v_signed), (observacao or "").strip()),
             )
         else:
             conn.execute(
-                f"""
-                INSERT INTO {tbl(conn, "investimentos_aportes")} (data, produto, valor, observacao)
+                """
+                INSERT INTO investimentos_aportes (data, produto, valor, observacao)
                 VALUES (?, ?, ?, ?)
                 """,
                 (data_str, (produto or "").strip(), float(v_signed), (observacao or "").strip()),
@@ -1649,8 +1613,8 @@ def update_invest_movimento(row: Dict) -> None:
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
             conn.execute(
-                f"""
-                UPDATE {tbl(conn, "investimentos_aportes")}
+                """
+                UPDATE investimentos_aportes
                 SET data = ?, produto = ?, tipo = ?, valor = ?, observacao = ?
                 WHERE id = ?
                 """,
@@ -1665,8 +1629,8 @@ def update_invest_movimento(row: Dict) -> None:
             )
         else:
             conn.execute(
-                f"""
-                UPDATE {tbl(conn, "investimentos_aportes")}
+                """
+                UPDATE investimentos_aportes
                 SET data = ?, produto = ?, valor = ?, observacao = ?
                 WHERE id = ?
                 """,
@@ -1694,7 +1658,7 @@ def delete_invest_aportes(ids: Iterable[int]) -> int:
         return 0
 
     with db_conn() as conn:
-        cur = conn.executemany(f"DELETE FROM {tbl(conn, 'investimentos_aportes')} WHERE id = ?", [(i,) for i in ids])
+        cur = conn.executemany("DELETE FROM investimentos_aportes WHERE id = ?", [(i,) for i in ids])
         return cur.rowcount
 
 
@@ -1854,96 +1818,6 @@ def generate_mock_data() -> None:
     for r in mock:
         insert_transacao(**r)
 
-
-
-# ============================================================
-# Fetch scoped data directly in SQL (avoids pandas date parsing pitfalls)
-# ============================================================
-
-def month_bounds_from_key(yyyy_mm: str) -> Tuple[date, date]:
-    y, m = map(int, yyyy_mm.split("-"))
-    start = date(y, m, 1)
-    end = add_months(start, 1)
-    return start, end
-
-def fetch_transacoes_scope(conn: DBConn, yyyy_mm: str, mode: str = "calendar", cutoff_day: int = 28) -> pd.DataFrame:
-    """Busca transações já filtradas no banco (mais confiável no Postgres)."""
-    mode = _normalize_mode(mode)
-    if mode == "budget":
-        # no modo orçamento, seleciona por chave de orçamento calculada a partir da data
-        # (mantém compatibilidade com os dados existentes)
-        start, end = month_bounds_from_key(yyyy_mm)
-        # janela maior para cobrir virada por cutoff
-        start2 = add_months(start, -1)
-        end2 = add_months(end, 1)
-        sql = f"""
-            SELECT id, data, descricao, categoria, tipo, valor, pagamento, status, origem, observacao,
-                   cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
-            FROM {tbl(conn, 'transacoes')}
-            WHERE data >= %s AND data < %s
-            ORDER BY data DESC, id DESC
-        """
-        df = conn.read_sql_df(sql, (start2, end2))
-        if df.empty:
-            return df
-        df["data"] = pd.to_datetime(df["data"], errors="coerce")
-        df = df.dropna(subset=["data"])
-        keys = budget_month_key_from_datetime(df["data"], cutoff_day)
-        df = df.loc[keys == yyyy_mm].copy()
-        return df
-
-    start, end = month_bounds_from_key(yyyy_mm)
-    sql = f"""
-        SELECT id, data, descricao, categoria, tipo, valor, pagamento, status, origem, observacao,
-               cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
-        FROM {tbl(conn, 'transacoes')}
-        WHERE data >= %s AND data < %s
-        ORDER BY data DESC, id DESC
-    """
-    df = conn.read_sql_df(sql, (start, end))
-    if not df.empty:
-        df["data"] = pd.to_datetime(df["data"], errors="coerce")
-        df = df.dropna(subset=["data"])
-    return df
-
-def fetch_invest_aportes_scope(conn: DBConn, yyyy_mm: str, mode: str = "calendar", cutoff_day: int = 28) -> pd.DataFrame:
-    """Busca aportes do mês direto no banco."""
-    mode = _normalize_mode(mode)
-    start, end = month_bounds_from_key(yyyy_mm)
-    if mode == "budget":
-        start = add_months(start, -1)
-        end = add_months(end, 1)
-    sql = f"""
-        SELECT id, data, ativo, classe, valor, rentab_pct, corretora, observacao, ref_month
-        FROM {tbl(conn, 'investimentos_aportes')}
-        WHERE data >= %s AND data < %s
-        ORDER BY data DESC, id DESC
-    """
-    df = conn.read_sql_df(sql, (start, end))
-    if df.empty:
-        return df
-    df["data"] = pd.to_datetime(df["data"], errors="coerce")
-    df = df.dropna(subset=["data"])
-    if mode == "budget":
-        keys = budget_month_key_from_datetime(df["data"], cutoff_day)
-        df = df.loc[keys == yyyy_mm].copy()
-    return df
-
-def debug_db_snapshot(conn: DBConn) -> Dict[str, Any]:
-    """Retorna um snapshot seguro (sem senha) para conferir se o app está na MESMA base do SQL Editor."""
-    out: Dict[str, Any] = {}
-    try:
-        out["db"] = conn.query_one("select current_database() as db")["db"]
-        out["usr"] = conn.query_one("select current_user as usr")["usr"]
-        out["schema"] = conn.query_one("select current_schema() as s")["s"]
-        out["search_path"] = conn.query_one("select current_setting('search_path') as sp")["sp"]
-        # Contagens
-        out["transacoes_count"] = conn.query_one(f"select count(*) as c from {tbl(conn,'transacoes')}")["c"]
-        out["transacoes_minmax"] = conn.query_one(f"select min(data)::text as min, max(data)::text as max from {tbl(conn,'transacoes')}")
-        out["invest_count"] = conn.query_one(f"select count(*) as c from {tbl(conn,'investimentos_aportes')}")["c"]
-    except Exception as e:
-        out["error"] = str(e)
-    return out
 
 # ============================================================
 # UI building blocks
@@ -2279,7 +2153,7 @@ def _scope_filters(
     cutoff_day: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     if scope == "month":
-        df_scope = df_scope_sql.copy() if (conn.kind == 'postgres') else filter_df_by_period(df_all, selected_month, st.session_state.analysis_mode, st.session_state.budget_cutoff_day)
+        df_scope = filter_df_by_period(df_all, "data", yyyy_mm, mode, cutoff_day)
         inv_scope = filter_df_by_period(inv_all, "data", yyyy_mm, mode, cutoff_day) if not inv_all.empty else inv_all
         inv_aportes = _sum_aportes(inv_scope) if not inv_scope.empty else 0.0
         return df_scope, inv_scope, float(inv_aportes)
@@ -3501,16 +3375,6 @@ def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
             best_schema, best_n = _pg_find_best_schema_with_data(conn, "transacoes")
 
             with st.sidebar.expander("🛠️ Dados não encontrados", expanded=True):
-                # Diagnóstico rápido (ajuda a entender onde seus dados estão)
-                if conn.kind == "pg":
-                    try:
-                        cur_count = _pg_rowcount(conn, user_schema, "transacoes")
-                        pub_count = _pg_rowcount(conn, "public", "transacoes")
-                        st.caption(f"Transações no schema atual ({user_schema}): {cur_count} | em public: {pub_count}")
-                    except Exception:
-                        st.caption("(Diagnóstico indisponível)")
-
-
                 st.warning(
                     "Não encontrei transações/investimentos no schema deste usuário. "
                     "Isso normalmente acontece quando o usuário está apontando para um schema vazio."
@@ -3558,7 +3422,7 @@ def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
 
                 with col1:
                     if st.button(f"Vincular meu usuário ao schema '{best_schema}'", use_container_width=True):
-                        _auth_update_user_schema(conn, user_id, best_schema)
+                        _auth_update_user_schema(conn, int(user_id), best_schema)
                         st.session_state["user_schema"] = best_schema
                         _rerun()
 
@@ -3570,7 +3434,7 @@ def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
 
                     if st.button(f"Copiar dados → '{dest_schema}'", use_container_width=True):
                         _pg_copy_app_data(conn, best_schema, dest_schema, clear_dst=True)
-                        _auth_update_user_schema(conn, user_id, dest_schema)
+                        _auth_update_user_schema(conn, int(user_id), dest_schema)
                         st.session_state["user_schema"] = dest_schema
                         _rerun()
 
@@ -3615,7 +3479,6 @@ def main():
             u = st.session_state['auth_user']
             st.markdown(f"**Usuário:** {u.get('display_name') or u.get('email')}")
             st.caption(f"Schema: `{st.session_state.get('user_schema','public')}`")
-            st.caption(f"DB: {'Supabase/Postgres' if USE_POSTGRES else 'SQLite local'}")
             if st.button('Sair (logout)'):
                 for k in ['auth_user','user_schema','_user_schema_ready']:
                     st.session_state.pop(k, None)
@@ -3665,9 +3528,6 @@ def main():
 
     # Se o usuário está em um schema vazio, ofereça resgate/cópia dos dados.
     _data_rescue_panel(df_all, inv_all)
-
-    if USE_POSTGRES and (df_all is not None and df_all.empty) and (inv_all is not None and inv_all.empty):
-        st.warning("Não encontrei dados no schema atual. Abra na barra lateral o painel **🆘 Resgatar meus dados** para localizar e copiar/vincular seus dados existentes (ex.: do schema public).")
 
     months = available_months(df_all, inv_all=inv_all, future_months=12, past_months=18, mode=mode, cutoff_day=cutoff_day)
     st.session_state["_months_list"] = months
