@@ -1,22 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
-import os
-import re
-
-# Postgres (Supabase) — opcional
-try:
-    import psycopg2  # pip install psycopg2-binary
-    import psycopg2.extras
-except Exception:  # pragma: no cover
-    psycopg2 = None
-
 from contextlib import contextmanager
 from datetime import date
 import calendar
-import uuid
-import bcrypt
-from datetime import datetime, timezone, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -30,513 +17,6 @@ from streamlit_option_menu import option_menu
 # ============================================================
 APP_TITLE = "Finanças Pessoais"
 DB_PATH = "financas.db"
-
-def _get_secret(key: str):
-    try:
-        return st.secrets.get(key)  # Streamlit Cloud
-    except Exception:
-        return None
-
-# Se existir DATABASE_URL, usa Supabase/Postgres; senão, usa SQLite local (financas.db)
-DATABASE_URL = os.getenv('DATABASE_URL') or _get_secret('DATABASE_URL')
-USE_POSTGRES = bool(DATABASE_URL and str(DATABASE_URL).lower().startswith('postgres'))
-
-def _rerun():
-    """Compat: Streamlit mudou de experimental_rerun() para rerun()."""
-    fn = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
-    if fn is None:
-        raise RuntimeError("Streamlit rerun() indisponível nesta versão.")
-    fn()
-
-
-def _adapt_sql(sql: str) -> str:
-    # SQLite usa '?', Postgres (psycopg2) usa '%s'
-    return sql.replace('?', '%s') if USE_POSTGRES else sql
-
-class DBConn:
-    """Wrapper para unificar SQLite e Postgres.
-
-    - conn.raw  -> conexão DB-API (sqlite3.Connection ou psycopg2.Connection)
-    - conn.kind -> 'sqlite' ou 'pg'
-    - conn.schema -> schema atual (Postgres) ou None (SQLite)
-    """
-
-    def __init__(self, raw, kind: str, schema: str | None = None):
-        self.raw = raw
-        self.kind = kind  # 'sqlite' | 'pg'
-        self.schema = schema
-
-    def cursor(self):
-        return self.raw.cursor()
-
-    def execute(self, sql: str, params=None):
-        sql2 = _adapt_sql(sql) if self.kind == "pg" else sql
-        cur = self.raw.cursor()
-        cur.execute(sql2, params or ())
-        return cur
-
-    def executemany(self, sql: str, seq_of_params):
-        sql2 = _adapt_sql(sql) if self.kind == "pg" else sql
-        cur = self.raw.cursor()
-        cur.executemany(sql2, seq_of_params)
-        return cur
-
-    def commit(self):
-        try:
-            self.raw.commit()
-        except Exception:
-            pass
-
-    def rollback(self):
-        try:
-            self.raw.rollback()
-        except Exception:
-            pass
-
-    def close(self):
-        try:
-            self.raw.close()
-        except Exception:
-            pass
-
-    def __getattr__(self, item):
-        # Proxy de atributos não implementados explicitamente (ex.: row_factory no sqlite)
-        return getattr(self.raw, item)
-# =============================================================================
-# Autenticação (Login + Multi-usuário por schema)
-# - auth tables ficam no schema PUBLIC
-# - dados do app ficam no schema do usuário (search_path: "<user_schema>", public)
-# =============================================================================
-
-AUTH_USERS_TABLE = "auth_users"
-AUTH_ATTEMPTS_TABLE = "auth_login_attempts"
-
-MAX_LOGIN_ATTEMPTS = 6
-LOCK_MINUTES = 15
-
-# Tabelas do app que serão clonadas para cada usuário (se existirem no public)
-KNOWN_APP_TABLES = [
-    "transacoes",
-    "orcamentos",
-    "cc_compras",
-    "cc_amortizacoes",
-    "investimentos_aportes",
-    "investimentos_config",
-    "app_config",
-    "app_settings",
-    "lancamentos_fixos",
-]
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _hash_password(password: str) -> str:
-    pw = password.encode("utf-8")
-    salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(pw, salt).decode("utf-8")
-
-def _verify_password(password: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
-        return False
-
-
-# ============================================================
-# Postgres helpers — localizar dados existentes e copiar/vincular
-# ============================================================
-
-def _pg_is_valid_ident(name: str) -> bool:
-    return bool(re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", name or ""))
-
-
-def _pg_qident(name: str) -> str:
-    """Quote seguro para identificadores já validados."""
-    if not _pg_is_valid_ident(name):
-        raise ValueError(f"Identificador inválido: {name!r}")
-    return f'"{name}"'
-
-
-def _pg_table_exists(conn: DBConn, schema: str, table: str) -> bool:
-    try:
-        cur = conn.raw.cursor()
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_name = %s
-            LIMIT 1
-            """,
-            (schema, table),
-        )
-        return cur.fetchone() is not None
-    except Exception:
-        return False
-
-
-def _pg_rowcount(conn: DBConn, schema: str, table: str) -> int | None:
-    """Retorna COUNT(*) ou None se não der para contar."""
-    try:
-        if not _pg_is_valid_ident(schema) or not _pg_is_valid_ident(table):
-            return None
-        cur = conn.raw.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM {_pg_qident(schema)}.{_pg_qident(table)}")
-        return int(cur.fetchone()[0])
-    except Exception:
-        return None
-
-
-def _pg_find_schemas_with_table(conn: DBConn, table: str) -> list[str]:
-    """Lista schemas que possuem a tabela informada."""
-    try:
-        cur = conn.raw.cursor()
-        cur.execute(
-            """
-            SELECT table_schema
-            FROM information_schema.tables
-            WHERE table_name = %s
-              AND table_schema NOT IN ('pg_catalog','information_schema')
-            ORDER BY table_schema
-            """,
-            (table,),
-        )
-        return [r[0] for r in cur.fetchall()]
-    except Exception:
-        return []
-
-
-def _pg_find_best_schema_with_data(conn: DBConn, table: str = "transacoes") -> tuple[str | None, int]:
-    """Procura o schema com mais linhas na tabela (padrão: transacoes)."""
-    best_schema, best_n = None, 0
-    for schema in _pg_find_schemas_with_table(conn, table):
-        n = _pg_rowcount(conn, schema, table)
-        if n is None:
-            continue
-        if n > best_n:
-            best_schema, best_n = schema, n
-    return best_schema, best_n
-
-
-def _pg_reset_id_sequence(conn: DBConn, schema: str, table: str, id_col: str = "id") -> None:
-    """Ajusta sequência SERIAL/IDENTITY para não colidir IDs."""
-    try:
-        if not (_pg_is_valid_ident(schema) and _pg_is_valid_ident(table) and _pg_is_valid_ident(id_col)):
-            return
-        cur = conn.raw.cursor()
-        # pg_get_serial_sequence retorna NULL se não houver sequence
-        cur.execute(
-            f"""
-            SELECT setval(
-                pg_get_serial_sequence(%s, %s),
-                COALESCE((SELECT MAX({_pg_qident(id_col)}) FROM {_pg_qident(schema)}.{_pg_qident(table)}), 0) + 1,
-                false
-            )
-            """,
-            (f"{schema}.{table}", id_col),
-        )
-        conn.raw.commit()
-    except Exception:
-        # Se a tabela não tiver sequence (ou for UUID), ignoramos
-        try:
-            conn.raw.rollback()
-        except Exception:
-            pass
-
-
-def _pg_copy_table_data(conn: DBConn, src_schema: str, dst_schema: str, table: str, clear_dst: bool = False) -> None:
-    if not (_pg_is_valid_ident(src_schema) and _pg_is_valid_ident(dst_schema) and _pg_is_valid_ident(table)):
-        raise ValueError("Schema/tabela inválidos.")
-
-    cur = conn.raw.cursor()
-
-    # garante schema destino
-    cur.execute(f'CREATE SCHEMA IF NOT EXISTS {_pg_qident(dst_schema)}')
-
-    # garante tabela destino (clonando estrutura)
-    if not _pg_table_exists(conn, dst_schema, table):
-        cur.execute(
-            f'CREATE TABLE {_pg_qident(dst_schema)}.{_pg_qident(table)} (LIKE {_pg_qident(src_schema)}.{_pg_qident(table)} INCLUDING ALL)'
-        )
-
-    if clear_dst:
-        cur.execute(f"TRUNCATE TABLE {_pg_qident(dst_schema)}.{_pg_qident(table)} RESTART IDENTITY CASCADE")
-
-    # copia
-    cur.execute(
-        f"INSERT INTO {_pg_qident(dst_schema)}.{_pg_qident(table)} SELECT * FROM {_pg_qident(src_schema)}.{_pg_qident(table)}"
-    )
-
-
-def _pg_copy_app_data(conn: DBConn, src_schema: str, dst_schema: str, clear_dst: bool = False) -> None:
-    """Copia TODAS as tabelas do app (KNOWN_APP_TABLES) de src_schema para dst_schema."""
-    cur = conn.raw.cursor()
-    try:
-        # valida
-        if not (_pg_is_valid_ident(src_schema) and _pg_is_valid_ident(dst_schema)):
-            raise ValueError("Schema inválido.")
-
-        # checa se src existe e tem a tabela principal
-        if not _pg_table_exists(conn, src_schema, "transacoes"):
-            raise RuntimeError(f"Não encontrei transacoes em '{src_schema}'.")
-
-        # copia por tabela
-        for t in KNOWN_APP_TABLES:
-            if _pg_table_exists(conn, src_schema, t):
-                _pg_copy_table_data(conn, src_schema, dst_schema, t, clear_dst=clear_dst)
-
-        conn.raw.commit()
-
-        # reseta sequences (onde houver)
-        for t in KNOWN_APP_TABLES:
-            _pg_reset_id_sequence(conn, dst_schema, t, "id")
-
-    except Exception:
-        try:
-            conn.raw.rollback()
-        except Exception:
-            pass
-        raise
-
-
-def _auth_update_user_schema(conn: DBConn, user_id: int, schema_name: str) -> None:
-    if not _pg_is_valid_ident(schema_name):
-        raise ValueError("Schema inválido.")
-    cur = conn.raw.cursor()
-    cur.execute("UPDATE app_users SET schema_name = %s WHERE id = %s", (schema_name, user_id))
-    conn.raw.commit()
-def _pg_ensure_auth_tables(raw) -> None:
-    """Cria as tabelas de autenticação no schema public."""
-    with raw.cursor() as cur:
-        cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS public.{AUTH_USERS_TABLE} (
-            id TEXT PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            display_name TEXT,
-            schema_name TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """)
-        cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS public.{AUTH_ATTEMPTS_TABLE} (
-            email TEXT PRIMARY KEY,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            locked_until TIMESTAMPTZ
-        );
-        """)
-    raw.commit()
-
-def _pg_public_tables(raw) -> List[str]:
-    with raw.cursor() as cur:
-        cur.execute("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-        """)
-        rows = cur.fetchall()
-    # RealDictCursor -> dict
-    if rows and isinstance(rows[0], dict):
-        return [r["table_name"] for r in rows]
-    return [r[0] for r in rows]
-
-def _pg_ensure_user_schema_and_tables(raw, schema_name: str) -> None:
-    """Cria o schema do usuário + clona tabelas do app a partir do public."""
-    if schema_name == "public":
-        return
-    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", schema_name):
-        raise RuntimeError(f"Schema inválido: {schema_name}")
-
-    existing_public = set(_pg_public_tables(raw))
-    tables_to_clone = [t for t in KNOWN_APP_TABLES if t in existing_public]
-
-    with raw.cursor() as cur:
-        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}";')
-        for t in tables_to_clone:
-            # Clona a estrutura (defaults/constraints). Os IDs podem continuar usando as sequences do public (ok).
-            cur.execute(
-                f'CREATE TABLE IF NOT EXISTS "{schema_name}"."{t}" (LIKE public."{t}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS);'
-            )
-    raw.commit()
-
-
-def _query_one(conn: DBConn, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-    cur = conn.execute(sql, params)
-    row = cur.fetchone()
-    if not row:
-        return None
-    if isinstance(row, dict):
-        return row
-    # sqlite3.Row
-    if hasattr(row, "keys"):
-        return {k: row[k] for k in row.keys()}
-    # fallback
-    return {"value": row[0]}
-
-def _auth_get_attempts(conn: DBConn, email: str) -> Tuple[int, Optional[datetime]]:
-    row = _query_one(conn, 
-        f"SELECT attempts, locked_until FROM public.{AUTH_ATTEMPTS_TABLE} WHERE lower(email)=lower(?)",
-        (email,),
-    )
-    if not row:
-        return 0, None
-    # locked_until pode vir como datetime ou string
-    locked = row.get("locked_until")
-    if isinstance(locked, str):
-        try:
-            locked = datetime.fromisoformat(locked)
-        except Exception:
-            locked = None
-    return int(row.get("attempts") or 0), locked
-
-def _auth_set_attempts(conn: DBConn, email: str, attempts: int, locked_until: Optional[datetime]) -> None:
-    # UPSERT compatível via SELECT WHERE NOT EXISTS
-    conn.execute(
-        f"""
-        INSERT INTO public.{AUTH_ATTEMPTS_TABLE} (email, attempts, locked_until)
-        SELECT ?, ?, ?
-        WHERE NOT EXISTS (SELECT 1 FROM public.{AUTH_ATTEMPTS_TABLE} WHERE lower(email)=lower(?))
-        """,
-        (email, attempts, locked_until, email),
-    )
-    conn.execute(
-        f"""
-        UPDATE public.{AUTH_ATTEMPTS_TABLE}
-        SET attempts = ?, locked_until = ?
-        WHERE lower(email)=lower(?)
-        """,
-        (attempts, locked_until, email),
-    )
-
-def _auth_clear_attempts(conn: DBConn, email: str) -> None:
-    conn.execute(f"DELETE FROM public.{AUTH_ATTEMPTS_TABLE} WHERE lower(email)=lower(?)", (email,))
-
-def _auth_get_user(conn: DBConn, email: str) -> Optional[Dict[str, Any]]:
-    row = _query_one(conn, 
-        f"""
-        SELECT id, email, password_hash, display_name, schema_name
-        FROM public.{AUTH_USERS_TABLE}
-        WHERE lower(email)=lower(?)
-        """,
-        (email,),
-    )
-    return row
-
-def _auth_users_count(conn: DBConn) -> int:
-    row = _query_one(conn, f"SELECT COUNT(*) AS n FROM public.{AUTH_USERS_TABLE}", ())
-    if not row:
-        return 0
-    return int(row.get("n") or 0)
-
-def _auth_create_user(conn: DBConn, email: str, password: str, display_name: str, schema_name: str) -> Dict[str, Any]:
-    user_id = str(uuid.uuid4())
-    pw_hash = _hash_password(password)
-
-    conn.execute(
-        f"""
-        INSERT INTO public.{AUTH_USERS_TABLE} (id, email, password_hash, display_name, schema_name)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (user_id, email, pw_hash, display_name, schema_name),
-    )
-    return {"id": user_id, "email": email, "display_name": display_name, "schema_name": schema_name}
-
-def auth_gate() -> bool:
-    """Mostra tela de login/cadastro e retorna True quando houver usuário logado."""
-    if st.session_state.get("auth_user"):
-        return True
-
-    st.title("🔐 Entrar no Controle de Finanças")
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.subheader("Login")
-        email = st.text_input("E-mail", key="login_email")
-        password = st.text_input("Senha", type="password", key="login_password")
-        if st.button("Entrar", type="primary"):
-            if not email or not password:
-                st.error("Preencha e-mail e senha.")
-                st.stop()
-
-            with db_conn("public") as conn:
-                attempts, locked_until = _auth_get_attempts(conn, email)
-                if locked_until and locked_until > _now_utc():
-                    mins = int((locked_until - _now_utc()).total_seconds() // 60) + 1
-                    st.error(f"Muitas tentativas. Tente novamente em ~{mins} minuto(s).")
-                    st.stop()
-
-                user = _auth_get_user(conn, email)
-                if not user or not _verify_password(password, user["password_hash"]):
-                    attempts = attempts + 1
-                    lock = None
-                    if attempts >= MAX_LOGIN_ATTEMPTS:
-                        lock = _now_utc() + timedelta(minutes=LOCK_MINUTES)
-                    _auth_set_attempts(conn, email, attempts, lock)
-                    conn.commit()
-                    st.error("E-mail ou senha inválidos.")
-                    st.stop()
-
-                # sucesso
-                _auth_clear_attempts(conn, email)
-                conn.commit()
-
-                st.session_state["auth_user"] = {
-                    "id": user["id"],
-                    "email": user["email"],
-                    "display_name": user.get("display_name") or "",
-                    "schema_name": user.get("schema_name") or "public",
-                }
-                st.session_state["user_schema"] = st.session_state["auth_user"]["schema_name"]
-                st.success("Login realizado! Carregando...")
-                _rerun()
-
-    with col2:
-        st.subheader("Criar conta")
-        name = st.text_input("Nome (como vai aparecer)", key="signup_name")
-        email2 = st.text_input("E-mail (novo)", key="signup_email")
-        pw1 = st.text_input("Senha (nova)", type="password", key="signup_pw1")
-        pw2 = st.text_input("Confirmar senha", type="password", key="signup_pw2")
-
-        with db_conn("public") as conn:
-            users_count = _auth_users_count(conn)
-
-        usar_dados_existentes = False
-        if users_count == 0 and USE_POSTGRES:
-            usar_dados_existentes = st.checkbox(
-                "Este é meu usuário principal (usar os dados que já existem no Supabase)",
-                value=True,
-                help="Marque para NÃO criar um schema separado. Assim você continua vendo seus dados atuais.",
-            )
-
-        if st.button("Criar conta", key="signup_btn"):
-            if not name or not email2 or not pw1 or not pw2:
-                st.error("Preencha todos os campos.")
-                st.stop()
-            if pw1 != pw2:
-                st.error("As senhas não conferem.")
-                st.stop()
-            if len(pw1) < 6:
-                st.error("Use uma senha com pelo menos 6 caracteres.")
-                st.stop()
-
-            schema_name = "public" if usar_dados_existentes else f"u_{uuid.uuid4().hex[:16]}"
-
-            with db_conn("public") as conn:
-                if _auth_get_user(conn, email2):
-                    st.error("Esse e-mail já está cadastrado.")
-                    st.stop()
-
-                # Se for um novo usuário (schema separado), garante schema + tabelas
-                if USE_POSTGRES and schema_name != "public":
-                    _pg_ensure_user_schema_and_tables(conn.raw, schema_name)
-
-                user = _auth_create_user(conn, email2, pw1, name, schema_name)
-                conn.commit()
-
-            st.success("Conta criada! Você já pode fazer login.")
-def read_sql_df(sql: str, conn: DBConn, params=()):
-    """pd.read_sql_query compatível com SQLite e Postgres."""
-    return pd.read_sql_query(_adapt_sql(sql), conn.raw, params=params or ())
-
 
 TIPOS = ["Despesa", "Receita"]
 
@@ -780,94 +260,25 @@ def filter_df_by_year(df: pd.DataFrame, date_col: str, year: int, mode: str, cut
 
 
 @contextmanager
-def db_conn(schema: Optional[str] = None):
-    """
-    Conexão única para SQLite (local) ou Postgres/Supabase (cloud).
-    - Se `schema` for None e existir usuário logado, usa o schema do usuário.
-    - Se `schema` for informado, força o schema (ex.: 'public' para autenticação).
-    """
-    if not USE_POSTGRES:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield DBConn(conn, "sqlite")
-        finally:
-            conn.close()
-        return
-
-    # --- Postgres/Supabase ---
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-
-    pg_url = None
-    # 1) Streamlit secrets (Cloud)
-    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
-        pg_url = st.secrets["DATABASE_URL"]
-    # 2) Variável de ambiente (local)
-    if not pg_url:
-        pg_url = os.environ.get("DATABASE_URL")
-
-    if not pg_url:
-        raise RuntimeError(
-            "DATABASE_URL não encontrado. Adicione em Streamlit Secrets (Cloud) "
-            "ou como variável de ambiente no seu PC."
-        )
-
-    raw = psycopg2.connect(pg_url, cursor_factory=RealDictCursor, sslmode="require")
-    raw.autocommit = False
-
-    target_schema = schema or st.session_state.get("user_schema") or "public"
-
+def db_conn(path: str = DB_PATH):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     try:
-        # Garante auth tables no public (uma vez por sessão)
-        if not st.session_state.get("_auth_tables_ready", False):
-            _pg_ensure_auth_tables(raw)
-            st.session_state["_auth_tables_ready"] = True
-
-        # Se não for public, garante schema do usuário + tabelas base clonadas
-        if target_schema != "public" and st.session_state.get("_user_schema_ready") != target_schema:
-            _pg_ensure_user_schema_and_tables(raw, target_schema)
-            st.session_state["_user_schema_ready"] = target_schema
-
-        # Ajusta search_path (schema do usuário primeiro; depois public para auth)
-        with raw.cursor() as cur:
-            if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", target_schema):
-                raise RuntimeError(f"Schema inválido: {target_schema}")
-            cur.execute(f'SET search_path TO "{target_schema}", public')
-        raw.commit()
-
-        yield DBConn(raw, "pg")
-
+        yield conn
+        conn.commit()
     except Exception:
-        raw.rollback()
+        conn.rollback()
         raise
     finally:
-        raw.close()
-def _table_cols(conn: DBConn, table: str) -> List[str]:
-    if conn.kind == "sqlite":
-        sql = "SELECT name FROM pragma_table_info(?)"
-        cur = conn.execute(sql, (table,))
-        rows = cur.fetchall()
-        return [r["name"] if isinstance(r, dict) else r[0] for r in rows]
+        conn.close()
 
-    # Postgres: usa o schema atual (primeiro do search_path) em vez de fixar 'public'
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = current_schema()
-      AND table_name = ?
-    ORDER BY ordinal_position
-    """
-    cur = conn.execute(sql, (table,))
-    rows = cur.fetchall()
-    if rows and isinstance(rows[0], dict):
-        return [r["column_name"] for r in rows]
-    return [r[0] for r in rows]
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {r["name"] for r in cur.fetchall()}
+
+
 def init_db() -> None:
-    # No Supabase/Postgres, o schema é criado/migrado pelo supabase_bootstrap.py (uma vez).
-    if USE_POSTGRES:
-        return
-
     with db_conn() as conn:
         cur = conn.cursor()
 
@@ -1035,7 +446,7 @@ def upsert_app_config(budget_mode: str, cutoff_day: int) -> None:
 
 def fetch_transacoes() -> pd.DataFrame:
     with db_conn() as conn:
-        df = read_sql_df(
+        df = pd.read_sql_query(
             """
             SELECT
                 id, data, descricao, categoria, tipo, valor, pagamento, status,
@@ -1067,7 +478,7 @@ def fetch_transacoes() -> pd.DataFrame:
 
 def fetch_orcamentos() -> pd.DataFrame:
     with db_conn() as conn:
-        df = read_sql_df("SELECT categoria, valor_teto FROM orcamentos", conn)
+        df = pd.read_sql_query("SELECT categoria, valor_teto FROM orcamentos", conn)
 
     if df.empty:
         return df
@@ -1142,9 +553,9 @@ def delete_transacoes(ids: Iterable[int]) -> int:
     ids = [int(i) for i in ids if str(i).strip().isdigit()]
     if not ids:
         return 0
-
     with db_conn() as conn:
-        cur = conn.executemany("DELETE FROM transacoes WHERE id = ?", [(i,) for i in ids])
+        cur = conn.cursor()
+        cur.executemany("DELETE FROM transacoes WHERE id = ?", [(i,) for i in ids])
         return cur.rowcount
 
 
@@ -1194,7 +605,7 @@ def delete_orcamento(categoria: str) -> None:
 
 def fetch_cc_compras() -> pd.DataFrame:
     with db_conn() as conn:
-        df = read_sql_df(
+        df = pd.read_sql_query(
             """
             SELECT id, data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo, created_at
             FROM cc_compras
@@ -1248,7 +659,7 @@ def set_cc_compra_ativo(cc_compra_id: int, ativo: int) -> None:
 def fetch_cc_amortizacoes(cc_compra_id: Optional[int] = None) -> pd.DataFrame:
     with db_conn() as conn:
         if cc_compra_id is None:
-            df = read_sql_df(
+            df = pd.read_sql_query(
                 """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
                 FROM cc_amortizacoes
@@ -1257,7 +668,7 @@ def fetch_cc_amortizacoes(cc_compra_id: Optional[int] = None) -> pd.DataFrame:
                 conn,
             )
         else:
-            df = read_sql_df(
+            df = pd.read_sql_query(
                 """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
                 FROM cc_amortizacoes
@@ -1421,7 +832,7 @@ def amortizar_compra(
     desconto = max(0.0, float(desconto))
 
     with db_conn() as conn:
-        df = read_sql_df(
+        df = pd.read_sql_query(
             """
             SELECT id, data, descricao, valor, cc_parcela_num, cc_parcela_total
             FROM transacoes
@@ -1552,12 +963,12 @@ def fetch_invest_aportes() -> pd.DataFrame:
     with db_conn() as conn:
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
-            df = read_sql_df(
+            df = pd.read_sql_query(
                 "SELECT id, data, produto, tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
                 conn,
             )
         else:
-            df = read_sql_df(
+            df = pd.read_sql_query(
                 "SELECT id, data, produto, 'Aporte' as tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
                 conn,
             )
@@ -1656,9 +1067,9 @@ def delete_invest_aportes(ids: Iterable[int]) -> int:
     ids = [int(i) for i in ids if str(i).strip().isdigit()]
     if not ids:
         return 0
-
     with db_conn() as conn:
-        cur = conn.executemany("DELETE FROM investimentos_aportes WHERE id = ?", [(i,) for i in ids])
+        cur = conn.cursor()
+        cur.executemany("DELETE FROM investimentos_aportes WHERE id = ?", [(i,) for i in ids])
         return cur.rowcount
 
 
@@ -2423,7 +1834,7 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                     try:
                         insert_transacao(d, desc, str(categoria), tipo, valor_f, pagamento, status)
                         st.success("Lançamento salvo!")
-                        _rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar: {e}")
 
@@ -2533,7 +1944,7 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                         update_transacao(payload)
 
                     st.success(f"Atualizado: {len(changed_ids)} lançamento(s).")
-                    _rerun()
+                    st.rerun()
 
             except Exception as e:
                 st.error(f"Falha ao salvar alterações: {e}")
@@ -2547,7 +1958,7 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                 else:
                     n = delete_transacoes(to_delete)
                     st.success(f"Excluídos: {n} lançamento(s).")
-                    _rerun()
+                    st.rerun()
             except Exception as e:
                 st.error(f"Falha ao excluir: {e}")
 
@@ -2670,7 +2081,7 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
                         insert_cc_compra(d_compra, str(desc), str(cat), tipo_compra, float(v), parcelas_db)
                         ensure_cc_generated(horizon_months=24)
                         st.success("Compra cadastrada! Parcelas/recorrências foram geradas.")
-                        _rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar compra: {e}")
 
@@ -2728,7 +2139,7 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
                 try:
                     set_cc_compra_ativo(int(id_sel), 0 if ativo_now == 1 else 1)
                     st.success("Atualizado.")
-                    _rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Falha: {e}")
         with c_act3:
@@ -2809,7 +2220,7 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
                                     observacao=str(obs),
                                 )
                                 st.success(f"Amortizado: {amort_qtd} parcela(s). Pago agora: {brl(valor_pago)}")
-                                _rerun()
+                                st.rerun()
                             except Exception as e:
                                 st.error(f"Falha ao amortizar: {e}")
 
@@ -2870,7 +2281,7 @@ def screen_planejamento(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_da
                     try:
                         upsert_orcamento(str(cat), float(teto))
                         st.success("Teto salvo!")
-                        _rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar teto: {e}")
 
@@ -2920,7 +2331,7 @@ def screen_planejamento(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_da
 
                 if changed or to_del:
                     st.success("Orçamentos atualizados!")
-                    _rerun()
+                    st.rerun()
                 else:
                     st.info("Nenhuma alteração detectada.")
 
@@ -3019,7 +2430,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
                 try:
                     upsert_invest_config(float(aporte_planejado), float(cdi_anual), float(pct_cdi))
                     st.success("Configurações salvas!")
-                    _rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Falha ao salvar: {e}")
 
@@ -3152,7 +2563,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
                             )
 
                         st.success("Movimento registrado!")
-                        _rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar: {e}")
 
@@ -3255,7 +2666,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
 
                     if changed:
                         st.success(f"Atualizado: {len(changed)} movimento(s).")
-                        _rerun()
+                        st.rerun()
                     else:
                         st.info("Nenhuma alteração detectada.")
 
@@ -3271,7 +2682,7 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
                     else:
                         n = delete_invest_aportes(to_delete)
                         st.success(f"Excluídos: {n} movimento(s).")
-                        _rerun()
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Falha ao excluir: {e}")
 
@@ -3335,10 +2746,18 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
     final_plan = float(y_plan[-1])
     delta = final_plan - final_real
 
+
+    months = int(years) * 12
+    aportes_real = principal + (real_pmt * months)
+    aportes_plan = principal + (planned_pmt * months)
+    juros_real = final_real - aportes_real
+    juros_plan = final_plan - aportes_plan
     st.markdown(
         "<div class='panel'>"
         f"<div style='font-size:1.15rem;font-weight:800'>Em {years} ano(s):</div>"
         f"<div class='small-muted' style='margin-top:6px'>Real: <b>{brl(final_real)}</b> &nbsp;|&nbsp; Planejado: <b>{brl(final_plan)}</b> &nbsp;|&nbsp; Diferença: <b>{brl(delta)}</b></div>"
+        f"<div class='small-muted' style='margin-top:6px'>Aportado (Real/Plan.): <b>{brl(aportes_real)}</b> &nbsp;|&nbsp; <b>{brl(aportes_plan)}</b></div>"
+        f"<div class='small-muted' style='margin-top:6px'>Juros (Real/Plan.): <b>{brl(juros_real)}</b> &nbsp;|&nbsp; <b>{brl(juros_plan)}</b></div>"
         f"<div class='small-muted' style='margin-top:6px'>Taxa usada: {(annual_rate*100):.2f}% a.a. (CDI {cfg['cdi_anual']:.2f}% * {cfg['pct_cdi']:.0f}%)</div>"
         "</div>",
         unsafe_allow_html=True,
@@ -3350,115 +2769,13 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
 # ============================================================
 
 
-
-def _data_rescue_panel(df_all: pd.DataFrame, inv_all: pd.DataFrame) -> None:
-    """Se não houver dados no schema do usuário, tenta encontrar onde os dados estão.
-
-    Isso resolve o caso clássico: você migrou dados para um schema (ex.: public),
-    criou login (schema por usuário), e o usuário entrou num schema vazio.
-    """
-    if not USE_POSTGRES:
-        return
-
-    user_id = st.session_state.get("user_id")
-    user_schema = st.session_state.get("user_schema") or "public"
-    if not user_id:
-        return
-
-    # se tem qualquer dado, não faz nada
-    if (df_all is not None and len(df_all) > 0) or (inv_all is not None and len(inv_all) > 0):
-        return
-
-    # abre conexão "public" (onde ficam app_users e onde podemos inspecionar schemas)
-    try:
-        with db_conn("public") as conn:
-            best_schema, best_n = _pg_find_best_schema_with_data(conn, "transacoes")
-
-            with st.sidebar.expander("🛠️ Dados não encontrados", expanded=True):
-                st.warning(
-                    "Não encontrei transações/investimentos no schema deste usuário. "
-                    "Isso normalmente acontece quando o usuário está apontando para um schema vazio."
-                )
-
-                # Diagnóstico rápido
-                st.caption(f"Seu usuário está configurado para schema: `{user_schema}`")
-                n_here = _pg_rowcount(conn, user_schema, "transacoes") if _pg_table_exists(conn, user_schema, "transacoes") else None
-                if n_here is None:
-                    st.write("Tabela `transacoes` não encontrada neste schema.")
-                else:
-                    st.write(f"Linhas em `{user_schema}.transacoes`: **{n_here}**")
-
-                if not best_schema or best_n == 0:
-                    st.error(
-                        "Também não encontrei dados em outros schemas. "
-                        "Verifique se o `DATABASE_URL` do Streamlit está apontando para o mesmo Supabase "
-                        "onde você migrou o `financas.db`."
-                    )
-                    st.info("Dica: no Streamlit Cloud, vá em **Manage app → Settings → Secrets** e confira o valor de `DATABASE_URL`.")
-                    return
-
-                if best_schema == user_schema:
-                    st.info("O schema correto já está selecionado. Se ainda assim aparece vazio, pode ser apenas o mês/ano selecionado.")
-                    return
-
-                st.success(f"Encontrei **{best_n}** transações em `{best_schema}.transacoes`.")
-
-                # lista schemas com contagem (top 8)
-                try:
-                    schemas = _pg_find_schemas_with_table(conn, "transacoes")
-                    counts = []
-                    for s in schemas:
-                        c = _pg_rowcount(conn, s, "transacoes") or 0
-                        if c > 0:
-                            counts.append((s, c))
-                    counts.sort(key=lambda x: x[1], reverse=True)
-                    if counts:
-                        st.caption("Schemas com dados (top):")
-                        st.write(pd.DataFrame(counts[:8], columns=["schema", "linhas_transacoes"]))
-                except Exception:
-                    pass
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    if st.button(f"Vincular meu usuário ao schema '{best_schema}'", use_container_width=True):
-                        _auth_update_user_schema(conn, int(user_id), best_schema)
-                        st.session_state["user_schema"] = best_schema
-                        _rerun()
-
-                with col2:
-                    # Se o usuário já está no public e ele está vazio, criamos um schema próprio e copiamos.
-                    dest_schema = user_schema
-                    if dest_schema == "public":
-                        dest_schema = f"u_{user_id}"
-
-                    if st.button(f"Copiar dados → '{dest_schema}'", use_container_width=True):
-                        _pg_copy_app_data(conn, best_schema, dest_schema, clear_dst=True)
-                        _auth_update_user_schema(conn, int(user_id), dest_schema)
-                        st.session_state["user_schema"] = dest_schema
-                        _rerun()
-
-    except Exception as e:
-        # não quebra o app por causa disso
-        st.sidebar.error(f"Falha ao diagnosticar dados no Supabase: {e}")
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="💰")
     st.markdown(CSS, unsafe_allow_html=True)
 
     init_db()
+    generate_mock_data()
     ensure_state()
-
-    # Login (no Supabase) — bloqueia o acesso sem senha
-    if USE_POSTGRES:
-        if not auth_gate():
-            return
-    else:
-        # SQLite local: por enquanto deixamos sem login (mais simples).
-        pass
-
-    # Dados de exemplo somente no SQLite local (evita inserir dados fake no Supabase)
-    if not USE_POSTGRES:
-        generate_mock_data()
 
     # carrega config persistida 1x por sessão
     if not st.session_state._period_cfg_loaded:
@@ -3473,18 +2790,6 @@ def main():
     ensure_cc_generated(horizon_months=24)
 
     with st.sidebar:
-
-        # --- Sessão / Usuário ---
-        if st.session_state.get('auth_user'):
-            u = st.session_state['auth_user']
-            st.markdown(f"**Usuário:** {u.get('display_name') or u.get('email')}")
-            st.caption(f"Schema: `{st.session_state.get('user_schema','public')}`")
-            if st.button('Sair (logout)'):
-                for k in ['auth_user','user_schema','_user_schema_ready']:
-                    st.session_state.pop(k, None)
-                _rerun()
-        else:
-            st.markdown('**Usuário:** (não logado)')
         st.markdown("### 💼 Finanças")
 
         with st.expander("🧾 Período / mês de orçamento", expanded=False):
@@ -3505,7 +2810,7 @@ def main():
                 st.session_state.analysis_mode = mode_new
                 st.session_state.budget_cutoff_day = int(cutoff_new)
                 st.success("Período salvo!")
-                _rerun()
+                st.rerun()
 
         selected = option_menu(
             None,
@@ -3521,37 +2826,13 @@ def main():
             },
         )
         st.markdown("---")
-    st.caption('Dados no Supabase (Postgres)' if USE_POSTGRES else 'Dados locais em SQLite (financas.db)')
+        st.caption("Dados locais em SQLite (financas.db)")
 
     df_all = fetch_transacoes()
     inv_all = fetch_invest_aportes()
 
-    # Se o usuário está em um schema vazio, ofereça resgate/cópia dos dados.
-    _data_rescue_panel(df_all, inv_all)
-
     months = available_months(df_all, inv_all=inv_all, future_months=12, past_months=18, mode=mode, cutoff_day=cutoff_day)
     st.session_state["_months_list"] = months
-
-    # Auto-ajuste: quando o app abre (ou após login), ir para o mês mais recente que possui dados.
-    if not st.session_state.get("period_autofit_done"):
-        try:
-            months_with_data = set()
-            if df_all is not None and (not df_all.empty) and ("data" in df_all.columns):
-                dts = pd.to_datetime(df_all["data"], errors="coerce")
-                months_with_data.update(dts.dropna().dt.strftime("%Y-%m").unique().tolist())
-            if inv_all is not None and (not inv_all.empty) and ("data" in inv_all.columns):
-                dts = pd.to_datetime(inv_all["data"], errors="coerce")
-                months_with_data.update(dts.dropna().dt.strftime("%Y-%m").unique().tolist())
-            # escolhe o mês mais recente que existe na lista de meses disponíveis
-            candidates = [m for m in months if m in months_with_data]
-            if candidates:
-                best_month = candidates[-1]
-                st.session_state["selected_month"] = best_month
-                st.session_state["selected_year"] = int(best_month.split("-")[0])
-        except Exception:
-            pass
-        st.session_state["period_autofit_done"] = True
-
     scope, yyyy_mm, year = top_bar(months, mode, cutoff_day)
 
     if selected == "Dashboard":
