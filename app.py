@@ -1855,6 +1855,96 @@ def generate_mock_data() -> None:
         insert_transacao(**r)
 
 
+
+# ============================================================
+# Fetch scoped data directly in SQL (avoids pandas date parsing pitfalls)
+# ============================================================
+
+def month_bounds_from_key(yyyy_mm: str) -> Tuple[date, date]:
+    y, m = map(int, yyyy_mm.split("-"))
+    start = date(y, m, 1)
+    end = add_months(start, 1)
+    return start, end
+
+def fetch_transacoes_scope(conn: DBConn, yyyy_mm: str, mode: str = "calendar", cutoff_day: int = 28) -> pd.DataFrame:
+    """Busca transações já filtradas no banco (mais confiável no Postgres)."""
+    mode = _normalize_mode(mode)
+    if mode == "budget":
+        # no modo orçamento, seleciona por chave de orçamento calculada a partir da data
+        # (mantém compatibilidade com os dados existentes)
+        start, end = month_bounds_from_key(yyyy_mm)
+        # janela maior para cobrir virada por cutoff
+        start2 = add_months(start, -1)
+        end2 = add_months(end, 1)
+        sql = f"""
+            SELECT id, data, descricao, categoria, tipo, valor, pagamento, status, origem, observacao,
+                   cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
+            FROM {tbl(conn, 'transacoes')}
+            WHERE data >= %s AND data < %s
+            ORDER BY data DESC, id DESC
+        """
+        df = conn.read_sql_df(sql, (start2, end2))
+        if df.empty:
+            return df
+        df["data"] = pd.to_datetime(df["data"], errors="coerce")
+        df = df.dropna(subset=["data"])
+        keys = budget_month_key_from_datetime(df["data"], cutoff_day)
+        df = df.loc[keys == yyyy_mm].copy()
+        return df
+
+    start, end = month_bounds_from_key(yyyy_mm)
+    sql = f"""
+        SELECT id, data, descricao, categoria, tipo, valor, pagamento, status, origem, observacao,
+               cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
+        FROM {tbl(conn, 'transacoes')}
+        WHERE data >= %s AND data < %s
+        ORDER BY data DESC, id DESC
+    """
+    df = conn.read_sql_df(sql, (start, end))
+    if not df.empty:
+        df["data"] = pd.to_datetime(df["data"], errors="coerce")
+        df = df.dropna(subset=["data"])
+    return df
+
+def fetch_invest_aportes_scope(conn: DBConn, yyyy_mm: str, mode: str = "calendar", cutoff_day: int = 28) -> pd.DataFrame:
+    """Busca aportes do mês direto no banco."""
+    mode = _normalize_mode(mode)
+    start, end = month_bounds_from_key(yyyy_mm)
+    if mode == "budget":
+        start = add_months(start, -1)
+        end = add_months(end, 1)
+    sql = f"""
+        SELECT id, data, ativo, classe, valor, rentab_pct, corretora, observacao, ref_month
+        FROM {tbl(conn, 'investimentos_aportes')}
+        WHERE data >= %s AND data < %s
+        ORDER BY data DESC, id DESC
+    """
+    df = conn.read_sql_df(sql, (start, end))
+    if df.empty:
+        return df
+    df["data"] = pd.to_datetime(df["data"], errors="coerce")
+    df = df.dropna(subset=["data"])
+    if mode == "budget":
+        keys = budget_month_key_from_datetime(df["data"], cutoff_day)
+        df = df.loc[keys == yyyy_mm].copy()
+    return df
+
+def debug_db_snapshot(conn: DBConn) -> Dict[str, Any]:
+    """Retorna um snapshot seguro (sem senha) para conferir se o app está na MESMA base do SQL Editor."""
+    out: Dict[str, Any] = {}
+    try:
+        out["db"] = conn.query_one("select current_database() as db")["db"]
+        out["usr"] = conn.query_one("select current_user as usr")["usr"]
+        out["schema"] = conn.query_one("select current_schema() as s")["s"]
+        out["search_path"] = conn.query_one("select current_setting('search_path') as sp")["sp"]
+        # Contagens
+        out["transacoes_count"] = conn.query_one(f"select count(*) as c from {tbl(conn,'transacoes')}")["c"]
+        out["transacoes_minmax"] = conn.query_one(f"select min(data)::text as min, max(data)::text as max from {tbl(conn,'transacoes')}")
+        out["invest_count"] = conn.query_one(f"select count(*) as c from {tbl(conn,'investimentos_aportes')}")["c"]
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
 # ============================================================
 # UI building blocks
 # ============================================================
@@ -2189,7 +2279,7 @@ def _scope_filters(
     cutoff_day: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     if scope == "month":
-        df_scope = filter_df_by_period(df_all, "data", yyyy_mm, mode, cutoff_day)
+        df_scope = df_scope_sql.copy() if (conn.kind == 'postgres') else filter_df_by_period(df_all, selected_month, st.session_state.analysis_mode, st.session_state.budget_cutoff_day)
         inv_scope = filter_df_by_period(inv_all, "data", yyyy_mm, mode, cutoff_day) if not inv_all.empty else inv_all
         inv_aportes = _sum_aportes(inv_scope) if not inv_scope.empty else 0.0
         return df_scope, inv_scope, float(inv_aportes)
