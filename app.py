@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+import base64
+import hashlib
+import hmac
 from contextlib import contextmanager
 from datetime import date
 import calendar
@@ -13,6 +17,57 @@ import streamlit as st
 from streamlit_option_menu import option_menu
 
 # ============================================================
+# Auth (multi-usuário)
+# ============================================================
+AUTH_PBKDF2_ITERS = 200_000
+LEGACY_USER_ID = 0  # dados antigos (pré-login) ficam com user_id=0 até serem atribuídos ao admin
+
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("utf-8"))
+
+
+def hash_password(password: str) -> Tuple[str, str]:
+    password = str(password or "")
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, AUTH_PBKDF2_ITERS)
+    return _b64e(salt), _b64e(dk)
+
+
+def verify_password(password: str, salt_b64: str, hash_b64: str) -> bool:
+    try:
+        salt = _b64d(salt_b64)
+        expected = _b64d(hash_b64)
+        dk = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, AUTH_PBKDF2_ITERS)
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False
+
+
+def require_user_id() -> int:
+    uid = st.session_state.get("user_id", None)
+    if uid is None:
+        raise RuntimeError("Usuário não autenticado.")
+    return int(uid)
+
+
+def is_admin() -> bool:
+    return bool(st.session_state.get("is_admin", False))
+
+
+def logout() -> None:
+    for k in ["user_id", "username", "display_name", "is_admin"]:
+        if k in st.session_state:
+            del st.session_state[k]
+    # força recarregar config do período quando logar novamente
+    st.session_state._period_cfg_loaded = False
+    st.rerun()
+
+# ============================================================
 # Config
 # ============================================================
 APP_TITLE = "Finanças Pessoais"
@@ -23,7 +78,7 @@ TIPOS = ["Despesa", "Receita"]
 # ✅ inclui "Amortizado" para cartão (adiantamento)
 STATUS = ["Pago", "Pendente", "Amortizado"]
 
-PAGAMENTOS = ["Crédito", "Débito", "PIX", "Dinheiro", "Boleto", "Transferência"]
+PAGAMENTOS = ["Crédito", "Débito", "Débito Automático", "PIX", "Dinheiro", "Boleto", "Transferência"]
 CATEGORIAS_DEFAULT = [
     "Alimentação",
     "Moradia",
@@ -53,6 +108,23 @@ PT_MONTHS = {
     11: "Novembro",
     12: "Dezembro",
 }
+
+# ============================================================
+# Investimentos
+# ============================================================
+# Tipos de movimento aceitos (usado para normalização e UI)
+INV_MOV_TYPES = ["Aporte", "Retirada"]
+
+# Produtos default para sugestão (usuário pode digitar/outros virão do histórico)
+INV_PRODUCTS_DEFAULT = [
+    "Renda Fixa (CDB/LCI/LCA)",
+    "Tesouro Direto",
+    "Fundo de Investimento",
+    "Ações/ETF",
+    "Cripto",
+    "Outro",
+]
+
 
 # ============================================================
 # Utils
@@ -282,35 +354,92 @@ def init_db() -> None:
     with db_conn() as conn:
         cur = conn.cursor()
 
-        # ---------- base ----------
+        # ---------- users ----------
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                display_name TEXT,
+                pw_salt TEXT NOT NULL,
+                pw_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);")
+
+        # ---------- base (multi-usuário) ----------
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS transacoes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 data DATE,
                 descricao TEXT,
                 categoria TEXT,
                 tipo TEXT,
                 valor REAL,
                 pagamento TEXT,
-                status TEXT
+                status TEXT DEFAULT 'Pago',
+                origem TEXT,
+                observacao TEXT,
+                cc_compra_id INTEGER,
+                cc_parcela_num INTEGER,
+                cc_parcela_total INTEGER,
+                ref_month TEXT,
+                fixo_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS orcamentos (
-                categoria TEXT PRIMARY KEY,
-                valor_teto REAL
+                user_id INTEGER NOT NULL DEFAULT 0,
+                categoria TEXT NOT NULL,
+                valor_teto REAL,
+                PRIMARY KEY (user_id, categoria)
             );
             """
         )
+
+        
+        # ---------- lançamentos fixos (Débito Automático) ----------
+        cur.execute(
+            """
+            
+CREATE TABLE IF NOT EXISTS lancamentos_fixos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL DEFAULT 0,
+    descricao TEXT NOT NULL,
+    categoria TEXT NOT NULL,
+    valor REAL NOT NULL,
+    pagamento TEXT NOT NULL DEFAULT 'Débito Automático',
+    status TEXT NOT NULL DEFAULT 'Pago',
+    dia INTEGER NOT NULL,
+    inicio_ym TEXT NOT NULL,   -- 'YYYY-MM'
+    intervalo_m INTEGER NOT NULL DEFAULT 1,  -- 1=mensal, 3=trimestral, 12=anual
+    fim_ym TEXT,               -- 'YYYY-MM' (opcional)
+    fim DATE,                  -- opcional (data exata)
+    paused_from_ym TEXT,        -- 'YYYY-MM' (opcional)
+    paused_until_ym TEXT,       -- 'YYYY-MM' (opcional)
+    ativo INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    cancelado_em TEXT
+);
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fixos_user ON lancamentos_fixos(user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fixos_user_ativo ON lancamentos_fixos(user_id, ativo);")
 
         # ---------- cartão (parcelado/recorrente + amortização) ----------
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS cc_compras (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 data_compra DATE,
                 descricao TEXT,
                 categoria TEXT,
@@ -318,7 +447,8 @@ def init_db() -> None:
                 total REAL,                -- total (avista/parcelado) | valor mensal (recorrente)
                 parcelas INTEGER,           -- 1 (avista) | N (parcelado) | NULL (recorrente)
                 ativo INTEGER DEFAULT 1,    -- 1=ativo, 0=inativo
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                fim DATE
             );
             """
         )
@@ -326,12 +456,13 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS cc_amortizacoes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 cc_compra_id INTEGER,
                 data DATE,
-                parcelas_amortizadas INTEGER,
-                desconto REAL,
+                parcelas_amortizadas INTEGER DEFAULT 0,
+                desconto REAL DEFAULT 0,
                 valor_pago REAL,
-                pagamento TEXT,
+                pagamento TEXT DEFAULT 'PIX',
                 observacao TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
@@ -343,68 +474,437 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS investimentos_aportes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 data DATE,
                 produto TEXT,
+                tipo TEXT,                 -- 'Aporte' | 'Retirada'
                 valor REAL,
-                observacao TEXT
+                observacao TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS investimentos_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                aporte_planejado REAL,
-                cdi_anual REAL,
-                pct_cdi REAL
+                user_id INTEGER PRIMARY KEY,
+                aporte_planejado REAL NOT NULL DEFAULT 0,
+                cdi_anual REAL NOT NULL DEFAULT 0,
+                pct_cdi REAL NOT NULL DEFAULT 100,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         cur.execute(
-            "INSERT OR IGNORE INTO investimentos_config (id, aporte_planejado, cdi_anual, pct_cdi) VALUES (1, 0.0, 0.0, 100.0);"
+            "INSERT OR IGNORE INTO investimentos_config (user_id, aporte_planejado, cdi_anual, pct_cdi) VALUES (0, 0.0, 0.0, 100.0);"
         )
 
         # ---------- config do app (modo de período) ----------
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS app_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+                user_id INTEGER PRIMARY KEY,
                 budget_mode TEXT,     -- 'calendar' | 'budget'
-                cutoff_day INTEGER    -- dia de virada do orçamento (ex: 28)
+                cutoff_day INTEGER,   -- dia de virada do orçamento (ex: 28)
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
-        cur.execute("INSERT OR IGNORE INTO app_config (id, budget_mode, cutoff_day) VALUES (1, 'calendar', 28);")
+        cur.execute("INSERT OR IGNORE INTO app_config (user_id, budget_mode, cutoff_day) VALUES (0, 'calendar', 28);")
 
-        # ---------- migração transacoes ----------
+        # ============================================================
+        # Migrações (compatibilidade com bancos antigos)
+        # ============================================================
+
+        # --- transacoes: user_id e colunas novas ---
         cols = _table_cols(conn, "transacoes")
+        if "user_id" not in cols:
+            cur.execute("ALTER TABLE transacoes ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0;")
+
         to_add = [
             ("origem", "TEXT"),
+            ("observacao", "TEXT"),
             ("cc_compra_id", "INTEGER"),
             ("cc_parcela_num", "INTEGER"),
             ("cc_parcela_total", "INTEGER"),
             ("ref_month", "TEXT"),
+            ("fixo_id", "INTEGER"),
+            ("created_at", "TEXT"),
         ]
+        cols = _table_cols(conn, "transacoes")
         for col, typ in to_add:
             if col not in cols:
+                # created_at em SQLite via ALTER não aplica DEFAULT em linhas antigas, mas não tem problema.
                 cur.execute(f"ALTER TABLE transacoes ADD COLUMN {col} {typ};")
 
-        # ---------- migração investimentos: tipo (Aporte/Retirada) ----------
-        inv_cols = _table_cols(conn, "investimentos_aportes")
-        if "tipo" not in inv_cols:
-            cur.execute("ALTER TABLE investimentos_aportes ADD COLUMN tipo TEXT;")
-            cur.execute("UPDATE investimentos_aportes SET tipo = 'Aporte' WHERE tipo IS NULL OR TRIM(tipo) = '';")
+        # --- cc_compras / cc_amortizacoes: user_id e coluna fim ---
+        if _table_exists(conn, "cc_compras"):
+            cc_cols = _table_cols(conn, "cc_compras")
+            if "user_id" not in cc_cols:
+                cur.execute("ALTER TABLE cc_compras ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0;")
+            if "fim" not in cc_cols:
+                cur.execute("ALTER TABLE cc_compras ADD COLUMN fim DATE;")
+        if _table_exists(conn, "cc_amortizacoes"):
+            am_cols = _table_cols(conn, "cc_amortizacoes")
+            if "user_id" not in am_cols:
+                cur.execute("ALTER TABLE cc_amortizacoes ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0;")
 
-        # índices
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_data ON transacoes(data);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_cc ON transacoes(cc_compra_id, cc_parcela_num, ref_month);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_invest_data ON investimentos_aportes(data);")
+        # --- investimentos_aportes: user_id + tipo ---
+        if _table_exists(conn, "investimentos_aportes"):
+            inv_cols = _table_cols(conn, "investimentos_aportes")
+            if "user_id" not in inv_cols:
+                cur.execute("ALTER TABLE investimentos_aportes ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0;")
+            if "tipo" not in inv_cols:
+                cur.execute("ALTER TABLE investimentos_aportes ADD COLUMN tipo TEXT;")
+                cur.execute("UPDATE investimentos_aportes SET tipo = CASE WHEN COALESCE(valor,0) < 0 THEN 'Retirada' ELSE 'Aporte' END WHERE tipo IS NULL OR TRIM(tipo) = '';")
+
+        # --- orcamentos: reconstrução para PK (user_id, categoria) ---
+        if _table_exists(conn, "orcamentos"):
+            orc_cols = _table_cols(conn, "orcamentos")
+            # banco antigo: só tem categoria/valor_teto
+            if "user_id" not in orc_cols:
+                cur.execute("ALTER TABLE orcamentos RENAME TO orcamentos_old;")
+                cur.execute(
+                    """
+                    CREATE TABLE orcamentos (
+                        user_id INTEGER NOT NULL DEFAULT 0,
+                        categoria TEXT NOT NULL,
+                        valor_teto REAL,
+                        PRIMARY KEY (user_id, categoria)
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO orcamentos (user_id, categoria, valor_teto)
+                    SELECT 0, categoria, valor_teto
+                    FROM orcamentos_old
+                    """
+                )
+                cur.execute("DROP TABLE orcamentos_old;")
+
+        # --- investimentos_config / app_config: reconstrução para user_id PK (banco antigo tinha id=1) ---
+        if _table_exists(conn, "investimentos_config"):
+            icols = _table_cols(conn, "investimentos_config")
+            if "id" in icols:
+                cur.execute("ALTER TABLE investimentos_config RENAME TO investimentos_config_old;")
+                cur.execute(
+                    """
+                    CREATE TABLE investimentos_config (
+                        user_id INTEGER PRIMARY KEY,
+                        aporte_planejado REAL NOT NULL DEFAULT 0,
+                        cdi_anual REAL NOT NULL DEFAULT 0,
+                        pct_cdi REAL NOT NULL DEFAULT 100,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                row = conn.execute(
+                    "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config_old WHERE id = 1"
+                ).fetchone()
+                ap = float((row["aporte_planejado"] if row else 0.0) or 0.0)
+                cdi = float((row["cdi_anual"] if row else 0.0) or 0.0)
+                pct = float((row["pct_cdi"] if row else 100.0) or 100.0)
+                cur.execute(
+                    "INSERT OR IGNORE INTO investimentos_config (user_id, aporte_planejado, cdi_anual, pct_cdi) VALUES (0, ?, ?, ?)",
+                    (ap, cdi, pct),
+                )
+                cur.execute("DROP TABLE investimentos_config_old;")
+
+        if _table_exists(conn, "app_config"):
+            acols = _table_cols(conn, "app_config")
+            if "id" in acols:
+                cur.execute("ALTER TABLE app_config RENAME TO app_config_old;")
+                cur.execute(
+                    """
+                    CREATE TABLE app_config (
+                        user_id INTEGER PRIMARY KEY,
+                        budget_mode TEXT,
+                        cutoff_day INTEGER,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                row = conn.execute("SELECT budget_mode, cutoff_day FROM app_config_old WHERE id = 1").fetchone()
+                mode = (row["budget_mode"] if row else "calendar") or "calendar"
+                cutoff = int((row["cutoff_day"] if row else 28) or 28)
+                cutoff = max(1, min(31, cutoff))
+                cur.execute(
+                    "INSERT OR IGNORE INTO app_config (user_id, budget_mode, cutoff_day) VALUES (0, ?, ?)",
+                    (str(mode).strip().lower(), cutoff),
+                )
+                cur.execute("DROP TABLE app_config_old;")
+
+        # --- tabelas extras (se existirem) ---
+        if _table_exists(conn, "lancamentos_fixos"):
+            lcols = _table_cols(conn, "lancamentos_fixos")
+            if "user_id" not in lcols:
+                cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0;")
+
+        # colunas novas para fixos (início_ym e cancelamento)
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "inicio_ym" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN inicio_ym TEXT;")
+            # best-effort: se existir coluna antiga 'inicio', tenta derivar 'YYYY-MM'
+            try:
+                cur.execute("UPDATE lancamentos_fixos SET inicio_ym = substr(inicio, 1, 7) WHERE (inicio_ym IS NULL OR inicio_ym = '') AND inicio IS NOT NULL;")
+            except Exception:
+                pass
+
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "cancelado_em" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN cancelado_em TEXT;")
+
+        # colunas novas para fixos (frequência, pausa, fim)
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "fim_ym" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN fim_ym TEXT;")
+
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "intervalo_m" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN intervalo_m INTEGER NOT NULL DEFAULT 1;")
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "fim" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN fim DATE;")
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "paused_from_ym" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN paused_from_ym TEXT;")
+        lcols = _table_cols(conn, "lancamentos_fixos")
+        if "paused_until_ym" not in lcols:
+            cur.execute("ALTER TABLE lancamentos_fixos ADD COLUMN paused_until_ym TEXT;")
+
+        if _table_exists(conn, "app_settings"):
+            scols = _table_cols(conn, "app_settings")
+            if "user_id" not in scols:
+                # app_settings antigo: key PK. Reconstrói como (user_id, key)
+                cur.execute("ALTER TABLE app_settings RENAME TO app_settings_old;")
+                cur.execute(
+                    """
+                    CREATE TABLE app_settings (
+                        user_id INTEGER NOT NULL DEFAULT 0,
+                        key TEXT NOT NULL,
+                        value TEXT,
+                        PRIMARY KEY (user_id, key)
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO app_settings (user_id, key, value)
+                    SELECT 0, key, value FROM app_settings_old
+                    """
+                )
+                cur.execute("DROP TABLE app_settings_old;")
+
+        # índices (com user_id)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_user_data ON transacoes(user_id, data);")
+        # Evita duplicar geração automática de fixos no mesmo mês
+        try:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_transacoes_user_fixo_ref ON transacoes(user_id, fixo_id, ref_month);")
+        except Exception:
+            # Se houver dados duplicados antigos, não bloqueia a inicialização.
+            pass
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_user_cc ON transacoes(user_id, cc_compra_id, cc_parcela_num, ref_month);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cc_compras_user_data ON cc_compras(user_id, data_compra);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cc_amort_user ON cc_amortizacoes(user_id, cc_compra_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_invest_user_data ON investimentos_aportes(user_id, data);")
 
 
-# ---------- App config CRUD ----------
-def fetch_app_config() -> Dict[str, object]:
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)).fetchone()
+    return row is not None
+
+
+def users_count() -> int:
     with db_conn() as conn:
-        row = conn.execute("SELECT budget_mode, cutoff_day FROM app_config WHERE id = 1").fetchone()
+        if not _table_exists(conn, "users"):
+            return 0
+        row = conn.execute("SELECT COUNT(1) AS n FROM users").fetchone()
+        return int(row["n"] if row else 0)
+
+
+def get_user_by_username(username: str) -> Optional[Dict[str, object]]:
+    username = str(username or "").strip()
+    if not username:
+        return None
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, username, display_name, pw_salt, pw_hash, is_admin
+            FROM users
+            WHERE lower(username) = lower(?)
+            """,
+            (username,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_user_defaults(user_id: int) -> None:
+    user_id = int(user_id)
+    with db_conn() as conn:
+        # app_config
+        row0 = conn.execute("SELECT budget_mode, cutoff_day FROM app_config WHERE user_id = ?", (LEGACY_USER_ID,)).fetchone()
+        mode0 = (row0["budget_mode"] if row0 else "calendar") or "calendar"
+        cutoff0 = int((row0["cutoff_day"] if row0 else 28) or 28)
+        cutoff0 = max(1, min(31, cutoff0))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO app_config (user_id, budget_mode, cutoff_day)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, str(mode0).strip().lower(), cutoff0),
+        )
+
+        # investimentos_config
+        rowi0 = conn.execute(
+            "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config WHERE user_id = ?",
+            (LEGACY_USER_ID,),
+        ).fetchone()
+        ap0 = float((rowi0["aporte_planejado"] if rowi0 else 0.0) or 0.0)
+        cdi0 = float((rowi0["cdi_anual"] if rowi0 else 0.0) or 0.0)
+        pct0 = float((rowi0["pct_cdi"] if rowi0 else 100.0) or 100.0)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO investimentos_config (user_id, aporte_planejado, cdi_anual, pct_cdi)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, ap0, cdi0, pct0),
+        )
+
+
+def create_user(username: str, display_name: str, password: str, admin: bool = False) -> int:
+    username = str(username or "").strip()
+    if not username:
+        raise ValueError("Username inválido.")
+
+    salt_b64, hash_b64 = hash_password(password)
+
+    with db_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO users (username, display_name, pw_salt, pw_hash, is_admin)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (username, str(display_name or "").strip(), salt_b64, hash_b64, 1 if admin else 0),
+        )
+        user_id = int(cur.lastrowid)
+
+    ensure_user_defaults(user_id)
+    return user_id
+
+
+def assign_legacy_data_to_user(user_id: int) -> None:
+    user_id = int(user_id)
+    tables = [
+        "transacoes",
+        "cc_compras",
+        "cc_amortizacoes",
+        "investimentos_aportes",
+        "orcamentos",
+        "investimentos_config",
+        "app_config",
+        # tabelas extras (se existirem)
+        "lancamentos_fixos",
+        "app_settings",
+    ]
+    with db_conn() as conn:
+        for t in tables:
+            if not _table_exists(conn, t):
+                continue
+            cols = _table_cols(conn, t)
+            if "user_id" not in cols:
+                continue
+            conn.execute(f"UPDATE {t} SET user_id = ? WHERE user_id = ?", (user_id, LEGACY_USER_ID))
+
+
+def _set_logged_user(user_row: Dict[str, object]) -> None:
+    st.session_state.user_id = int(user_row["id"])
+    st.session_state.username = str(user_row.get("username") or "")
+    st.session_state.display_name = str(user_row.get("display_name") or user_row.get("username") or "")
+    st.session_state.is_admin = bool(int(user_row.get("is_admin") or 0))
+    # força recarregar config do período (multiusuário)
+    st.session_state._period_cfg_loaded = False
+
+
+def auth_gate() -> bool:
+    """
+    Retorna True quando autenticado.
+    Quando não autenticado, renderiza a tela de login/criação de admin e retorna False.
+    """
+    if st.session_state.get("user_id", None) is not None:
+        return True
+
+    st.markdown(f"## 🔐 {APP_TITLE} — Login")
+
+    n = users_count()
+    if n == 0:
+        st.info("Primeiro acesso: crie seu usuário ADMIN. Todos os dados existentes serão atribuídos a ele.")
+        with st.form("create_admin"):
+            u = st.text_input("Usuário (username)", value="admin")
+            d = st.text_input("Nome exibido", value="Administrador")
+            p1 = st.text_input("Senha", type="password")
+            p2 = st.text_input("Confirmar senha", type="password")
+            submitted = st.form_submit_button("Criar ADMIN")
+        if submitted:
+            if not u.strip():
+                st.error("Preencha o usuário.")
+                return False
+            if not p1:
+                st.error("Preencha a senha.")
+                return False
+            if p1 != p2:
+                st.error("As senhas não conferem.")
+                return False
+            try:
+                uid = create_user(u, d, p1, admin=True)
+                assign_legacy_data_to_user(uid)
+                row = get_user_by_username(u)
+                if row:
+                    _set_logged_user(row)
+                    st.success("ADMIN criado e dados migrados com sucesso.")
+                    st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("Este usuário já existe.")
+            except Exception as e:
+                st.error(f"Falha ao criar ADMIN: {e}")
+        return False
+
+    with st.form("login_form"):
+        u = st.text_input("Usuário")
+        p = st.text_input("Senha", type="password")
+        submitted = st.form_submit_button("Entrar")
+    if submitted:
+        row = get_user_by_username(u)
+        if not row:
+            st.error("Usuário não encontrado.")
+            return False
+        if not verify_password(p, str(row["pw_salt"]), str(row["pw_hash"])):
+            st.error("Senha incorreta.")
+            return False
+        _set_logged_user(row)
+        st.rerun()
+
+    st.caption("Dica: somente o ADMIN cria novos usuários (Cadastro A).")
+    return False
+
+
+def fetch_app_config() -> Dict[str, object]:
+    uid = require_user_id()
+    with db_conn() as conn:
+        row = conn.execute("SELECT budget_mode, cutoff_day FROM app_config WHERE user_id = ?", (uid,)).fetchone()
+
+        if not row:
+            # cria defaults para este usuário copiando do legado (0)
+            row0 = conn.execute("SELECT budget_mode, cutoff_day FROM app_config WHERE user_id = ?", (LEGACY_USER_ID,)).fetchone()
+            mode0 = (row0["budget_mode"] if row0 else "calendar") or "calendar"
+            cutoff0 = int((row0["cutoff_day"] if row0 else 28) or 28)
+            cutoff0 = max(1, min(31, cutoff0))
+            conn.execute(
+                "INSERT OR IGNORE INTO app_config (user_id, budget_mode, cutoff_day) VALUES (?, ?, ?)",
+                (uid, str(mode0).strip().lower(), cutoff0),
+            )
+            row = conn.execute("SELECT budget_mode, cutoff_day FROM app_config WHERE user_id = ?", (uid,)).fetchone()
 
     if not row:
         return {"budget_mode": "calendar", "cutoff_day": 28}
@@ -419,6 +919,8 @@ def fetch_app_config() -> Dict[str, object]:
 
 
 def upsert_app_config(budget_mode: str, cutoff_day: int) -> None:
+    uid = require_user_id()
+
     budget_mode = str(budget_mode or "calendar").strip().lower()
     if budget_mode not in {"calendar", "budget"}:
         budget_mode = "calendar"
@@ -429,22 +931,18 @@ def upsert_app_config(budget_mode: str, cutoff_day: int) -> None:
     with db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO app_config (id, budget_mode, cutoff_day)
-            VALUES (1, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
+            INSERT INTO app_config (user_id, budget_mode, cutoff_day)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
                 budget_mode = excluded.budget_mode,
                 cutoff_day = excluded.cutoff_day
             """,
-            (budget_mode, cutoff_day),
+            (uid, budget_mode, cutoff_day),
         )
 
 
-# ============================================================
-# Fetch/CRUD (Transações)
-# ============================================================
-
-
 def fetch_transacoes() -> pd.DataFrame:
+    uid = require_user_id()
     with db_conn() as conn:
         df = pd.read_sql_query(
             """
@@ -452,8 +950,10 @@ def fetch_transacoes() -> pd.DataFrame:
                 id, data, descricao, categoria, tipo, valor, pagamento, status,
                 origem, cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
             FROM transacoes
+            WHERE user_id = ?
             """,
             conn,
+            params=(uid,),
         )
 
     if df.empty:
@@ -467,18 +967,23 @@ def fetch_transacoes() -> pd.DataFrame:
     df["status"] = df["status"].astype(str).fillna("Pago")
     df["origem"] = df.get("origem", "").astype(str).fillna("")
     df["ref_month"] = df.get("ref_month", "").astype(str).fillna("")
-    df["cc_compra_id"] = pd.to_numeric(df.get("cc_compra_id", None), errors="coerce")
-    df["cc_parcela_num"] = pd.to_numeric(df.get("cc_parcela_num", None), errors="coerce")
-    df["cc_parcela_total"] = pd.to_numeric(df.get("cc_parcela_total", None), errors="coerce")
-    df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0).astype(float)
 
-    df = df.dropna(subset=["data"]).copy()
+    # normaliza valores numéricos
+    df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0).astype(float)
+    df["cc_compra_id"] = pd.to_numeric(df.get("cc_compra_id"), errors="coerce").fillna(pd.NA)
+    df["cc_parcela_num"] = pd.to_numeric(df.get("cc_parcela_num"), errors="coerce").fillna(pd.NA)
+    df["cc_parcela_total"] = pd.to_numeric(df.get("cc_parcela_total"), errors="coerce").fillna(pd.NA)
     return df
 
 
 def fetch_orcamentos() -> pd.DataFrame:
+    uid = require_user_id()
     with db_conn() as conn:
-        df = pd.read_sql_query("SELECT categoria, valor_teto FROM orcamentos", conn)
+        df = pd.read_sql_query(
+            "SELECT categoria, valor_teto FROM orcamentos WHERE user_id = ?",
+            conn,
+            params=(uid,),
+        )
 
     if df.empty:
         return df
@@ -497,14 +1002,15 @@ def insert_transacao(
     pagamento: str,
     status: str,
 ) -> None:
+    uid = require_user_id()
     data_str = pd.Timestamp(data).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO transacoes (data, descricao, categoria, tipo, valor, pagamento, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transacoes (user_id, data, descricao, categoria, tipo, valor, pagamento, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (data_str, descricao.strip(), categoria.strip(), tipo, float(valor), pagamento, status),
+            (uid, data_str, descricao.strip(), categoria.strip(), tipo, float(valor), pagamento, status),
         )
 
 
@@ -522,17 +1028,20 @@ def insert_transacao_extra(
     cc_parcela_total: Optional[int] = None,
     ref_month: Optional[str] = None,
 ) -> None:
+    uid = require_user_id()
     data_str = pd.Timestamp(data).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
             """
             INSERT INTO transacoes (
+                user_id,
                 data, descricao, categoria, tipo, valor, pagamento, status,
                 origem, cc_compra_id, cc_parcela_num, cc_parcela_total, ref_month
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                uid,
                 data_str,
                 descricao.strip(),
                 categoria.strip(),
@@ -550,22 +1059,24 @@ def insert_transacao_extra(
 
 
 def delete_transacoes(ids: Iterable[int]) -> int:
+    uid = require_user_id()
     ids = [int(i) for i in ids if str(i).strip().isdigit()]
     if not ids:
         return 0
     with db_conn() as conn:
         cur = conn.cursor()
-        cur.executemany("DELETE FROM transacoes WHERE id = ?", [(i,) for i in ids])
+        cur.executemany("DELETE FROM transacoes WHERE id = ? AND user_id = ?", [(i, uid) for i in ids])
         return cur.rowcount
 
 
 def update_transacao(row: Dict) -> None:
+    uid = require_user_id()
     with db_conn() as conn:
         conn.execute(
             """
             UPDATE transacoes
             SET data = ?, descricao = ?, categoria = ?, tipo = ?, valor = ?, pagamento = ?, status = ?
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
             (
                 row["data"],
@@ -576,42 +1087,43 @@ def update_transacao(row: Dict) -> None:
                 row["pagamento"],
                 row["status"],
                 int(row["id"]),
+                uid,
             ),
         )
 
 
 def upsert_orcamento(categoria: str, valor_teto: float) -> None:
+    uid = require_user_id()
     categoria = categoria.strip()
     with db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO orcamentos (categoria, valor_teto)
-            VALUES (?, ?)
-            ON CONFLICT(categoria) DO UPDATE SET valor_teto = excluded.valor_teto
+            INSERT INTO orcamentos (user_id, categoria, valor_teto)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, categoria) DO UPDATE SET valor_teto = excluded.valor_teto
             """,
-            (categoria, float(valor_teto)),
+            (uid, categoria, float(valor_teto)),
         )
 
 
 def delete_orcamento(categoria: str) -> None:
+    uid = require_user_id()
     with db_conn() as conn:
-        conn.execute("DELETE FROM orcamentos WHERE categoria = ?", (categoria,))
-
-
-# ============================================================
-# Cartão: compras + amortização
-# ============================================================
+        conn.execute("DELETE FROM orcamentos WHERE categoria = ? AND user_id = ?", (categoria, uid))
 
 
 def fetch_cc_compras() -> pd.DataFrame:
+    uid = require_user_id()
     with db_conn() as conn:
         df = pd.read_sql_query(
             """
-            SELECT id, data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo, created_at
+            SELECT id, data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo, created_at, fim
             FROM cc_compras
+            WHERE user_id = ?
             ORDER BY id DESC
             """,
             conn,
+            params=(uid,),
         )
     if df.empty:
         return df
@@ -620,8 +1132,9 @@ def fetch_cc_compras() -> pd.DataFrame:
     df["categoria"] = df["categoria"].astype(str).fillna("Outros")
     df["tipo_compra"] = df["tipo_compra"].astype(str).fillna("avista")
     df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0.0).astype(float)
-    df["parcelas"] = pd.to_numeric(df["parcelas"], errors="coerce")
+    df["parcelas"] = pd.to_numeric(df["parcelas"], errors="coerce").fillna(pd.NA)
     df["ativo"] = pd.to_numeric(df["ativo"], errors="coerce").fillna(1).astype(int)
+    df["fim"] = pd.to_datetime(df.get("fim"), errors="coerce")
     return df
 
 
@@ -633,14 +1146,16 @@ def insert_cc_compra(
     total: float,
     parcelas: Optional[int],
 ) -> None:
+    uid = require_user_id()
     data_str = pd.Timestamp(data_compra).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO cc_compras (data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO cc_compras (user_id, data_compra, descricao, categoria, tipo_compra, total, parcelas, ativo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
+                uid,
                 data_str,
                 descricao.strip(),
                 categoria.strip(),
@@ -652,39 +1167,46 @@ def insert_cc_compra(
 
 
 def set_cc_compra_ativo(cc_compra_id: int, ativo: int) -> None:
+    uid = require_user_id()
     with db_conn() as conn:
-        conn.execute("UPDATE cc_compras SET ativo = ? WHERE id = ?", (int(ativo), int(cc_compra_id)))
+        conn.execute(
+            "UPDATE cc_compras SET ativo = ?, fim = CASE WHEN ? = 1 THEN NULL ELSE fim END WHERE id = ? AND user_id = ?",
+            (int(ativo), int(ativo), int(cc_compra_id), uid),
+        )
 
 
 def fetch_cc_amortizacoes(cc_compra_id: Optional[int] = None) -> pd.DataFrame:
+    uid = require_user_id()
     with db_conn() as conn:
         if cc_compra_id is None:
             df = pd.read_sql_query(
                 """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
                 FROM cc_amortizacoes
+                WHERE user_id = ?
                 ORDER BY id DESC
                 """,
                 conn,
+                params=(uid,),
             )
         else:
             df = pd.read_sql_query(
                 """
                 SELECT id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao, created_at
                 FROM cc_amortizacoes
-                WHERE cc_compra_id = ?
+                WHERE user_id = ? AND cc_compra_id = ?
                 ORDER BY id DESC
                 """,
                 conn,
-                params=(int(cc_compra_id),),
+                params=(uid, int(cc_compra_id)),
             )
     if df.empty:
         return df
     df["data"] = pd.to_datetime(df["data"], errors="coerce")
+    df["parcelas_amortizadas"] = pd.to_numeric(df["parcelas_amortizadas"], errors="coerce").fillna(0).astype(int)
     df["desconto"] = pd.to_numeric(df["desconto"], errors="coerce").fillna(0.0).astype(float)
     df["valor_pago"] = pd.to_numeric(df["valor_pago"], errors="coerce").fillna(0.0).astype(float)
-    df["parcelas_amortizadas"] = pd.to_numeric(df["parcelas_amortizadas"], errors="coerce").fillna(0).astype(int)
-    df["pagamento"] = df["pagamento"].astype(str).fillna("")
+    df["pagamento"] = df["pagamento"].astype(str).fillna("PIX")
     df["observacao"] = df["observacao"].astype(str).fillna("")
     return df
 
@@ -698,40 +1220,45 @@ def insert_cc_amortizacao(
     pagamento: str,
     observacao: str = "",
 ) -> None:
+    uid = require_user_id()
     data_str = pd.Timestamp(data_).strftime("%Y-%m-%d")
     with db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO cc_amortizacoes (cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cc_amortizacoes (user_id, cc_compra_id, data, parcelas_amortizadas, desconto, valor_pago, pagamento, observacao)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                uid,
                 int(cc_compra_id),
                 data_str,
                 int(parcelas_amortizadas),
                 float(desconto),
                 float(valor_pago),
-                pagamento.strip(),
-                (observacao or "").strip(),
+                pagamento,
+                observacao.strip(),
             ),
         )
 
 
-def _cc_transacao_exists(cc_compra_id: int, cc_parcela_num: Optional[int], ref_month: str) -> bool:
+def _cc_transacao_exists(cc_compra_id: int, parcela_num: Optional[int], ref_month: str) -> bool:
+    uid = require_user_id()
     with db_conn() as conn:
         cur = conn.execute(
             """
             SELECT 1
             FROM transacoes
-            WHERE cc_compra_id = ?
+            WHERE user_id = ?
+              AND cc_compra_id = ?
               AND (cc_parcela_num IS ? OR cc_parcela_num = ?)
               AND ref_month = ?
               AND pagamento = 'Crédito'
             LIMIT 1
             """,
-            (int(cc_compra_id), cc_parcela_num, cc_parcela_num, ref_month),
+            (uid, int(cc_compra_id), parcela_num, parcela_num, ref_month),
         )
         return cur.fetchone() is not None
+
 
 
 def ensure_cc_generated(horizon_months: int = 24) -> None:
@@ -741,79 +1268,517 @@ def ensure_cc_generated(horizon_months: int = 24) -> None:
         return
 
     today = date.today()
-    horizon_end = add_months(date(today.year, today.month, 1), horizon_months)
+    horizon_end = add_months(date(today.year, today.month, 1), int(horizon_months))
 
     for _, r in compras.iterrows():
-        if int(r.get("ativo", 1)) != 1:
+        try:
+            if int(r.get("ativo", 1)) != 1:
+                continue
+
+            cc_id = int(r["id"])
+
+            data_compra_ts = r.get("data_compra")
+            if pd.isna(data_compra_ts):
+                continue
+            data_compra = pd.to_datetime(data_compra_ts).date()
+
+            desc = str(r.get("descricao") or "").strip() or "Compra no cartão"
+            cat = str(r.get("categoria") or "").strip() or "Outros"
+            tipo_compra = str(r.get("tipo_compra") or "").strip().lower()
+            total = float(r.get("total") or 0.0)
+
+            fim_date = None
+            fim_ts = r.get("fim", None)
+            if pd.notna(fim_ts):
+                try:
+                    fim_date = pd.to_datetime(fim_ts).date()
+                except Exception:
+                    fim_date = None
+
+            if tipo_compra == "recorrente":
+                d = date(data_compra.year, data_compra.month, 1)
+                k = 0
+                while d <= horizon_end:
+                    ref = f"{d.year:04d}-{d.month:02d}"
+                    dia = clamp_day_to_month(d.year, d.month, data_compra.day)
+                    dt_lanc = date(d.year, d.month, dia)
+
+                    if fim_date is not None and dt_lanc > fim_date:
+                        break
+
+                    if not _cc_transacao_exists(cc_id, None, ref):
+                        insert_transacao_extra(
+                            data=dt_lanc,
+                            descricao=f"{desc} (Recorrente)",
+                            categoria=cat,
+                            tipo="Despesa",
+                            valor=total,
+                            pagamento="Crédito",
+                            status="Pendente",
+                            origem="Cartão",
+                            cc_compra_id=cc_id,
+                            cc_parcela_num=None,
+                            cc_parcela_total=None,
+                            ref_month=ref,
+                        )
+                    d = add_months(d, 1)
+                    k += 1
+                    if k > 600:
+                        break
+
+            elif tipo_compra in {"avista", "parcelado"}:
+                parcelas_raw = r.get("parcelas")
+                parcelas = int(parcelas_raw) if pd.notna(parcelas_raw) else 1
+                parcelas = max(1, parcelas)
+                vals = split_installments(total, parcelas)
+
+                for i in range(parcelas):
+                    parc_num = i + 1
+                    dt = add_months(data_compra, i)
+                    ref = f"{dt.year:04d}-{dt.month:02d}"
+
+                    if fim_date is not None and dt > fim_date:
+                        break
+
+                    if not _cc_transacao_exists(cc_id, parc_num, ref):
+                        sufixo = f" ({parc_num}/{parcelas})" if parcelas > 1 else ""
+                        insert_transacao_extra(
+                            data=dt,
+                            descricao=f"{desc}{sufixo}",
+                            categoria=cat,
+                            tipo="Despesa",
+                            valor=float(vals[i]),
+                            pagamento="Crédito",
+                            status="Pendente",
+                            origem="Cartão",
+                            cc_compra_id=cc_id,
+                            cc_parcela_num=parc_num,
+                            cc_parcela_total=parcelas,
+                            ref_month=ref,
+                        )
+            else:
+                # tipo desconhecido
+                continue
+        except Exception:
+            # não quebra o app por uma compra inválida
             continue
 
-        cc_id = int(r["id"])
-        data_compra_ts = r["data_compra"]
-        if pd.isna(data_compra_ts):
-            continue
-        data_compra = data_compra_ts.date()
 
-        desc = str(r["descricao"]).strip() or "Compra no cartão"
-        cat = str(r["categoria"]).strip() or "Outros"
-        tipo_compra = str(r["tipo_compra"]).strip().lower()
-        total = float(r["total"])
+# ============================================================
+# Fixos (Débito Automático)
+# ============================================================
 
-        if tipo_compra == "recorrente":
-            d0 = date(data_compra.year, data_compra.month, 1)
-            d = d0
+def parse_ym(yyyy_mm: str) -> Tuple[int, int]:
+    y, m = yyyy_mm.split("-")
+    return int(y), int(m)
+
+
+def next_month_key(yyyy_mm: str) -> str:
+    y, m = parse_ym(yyyy_mm)
+    return month_key(pd.Timestamp(add_months(date(y, m, 1), 1)))
+
+
+def last_day_date_of_ym(yyyy_mm: str) -> date:
+    y, m = parse_ym(yyyy_mm)
+    last_day = calendar.monthrange(y, m)[1]
+    return date(y, m, last_day)
+
+
+def fetch_fixos(include_inactive: bool = True) -> pd.DataFrame:
+    uid = require_user_id()
+    where = "" if include_inactive else "AND ativo = 1"
+    with db_conn() as conn:
+        df = pd.read_sql_query(
+            f"""
+            SELECT id, descricao, categoria, valor, pagamento, status, dia, inicio_ym, intervalo_m, fim_ym, fim, paused_from_ym, paused_until_ym, ativo, created_at, cancelado_em
+            FROM lancamentos_fixos
+            WHERE user_id = ?
+            {where}
+            ORDER BY ativo DESC, id DESC
+            """,
+            conn,
+            params=(uid,),
+        )
+    return df
+
+
+def _fixo_transacao_exists(fixo_id: int, ref_month: str) -> bool:
+    uid = require_user_id()
+    with db_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT 1
+            FROM transacoes
+            WHERE user_id = ?
+              AND fixo_id = ?
+              AND ref_month = ?
+            LIMIT 1
+            """,
+            (uid, int(fixo_id), str(ref_month)),
+        )
+        return cur.fetchone() is not None
+
+
+
+def ensure_fixos_generated(horizon_months: int = 24) -> None:
+    """Gera (idempotente) as despesas fixas em Débito Automático para meses futuros."""
+    try:
+        fixos = fetch_fixos(include_inactive=False)
+    except Exception:
+        return
+    if fixos.empty:
+        return
+
+    today = date.today()
+    horizon_end = add_months(date(today.year, today.month, 1), int(horizon_months))
+
+    for _, r in fixos.iterrows():
+        try:
+            if int(r.get("ativo", 1)) != 1:
+                continue
+
+            fixo_id = int(r["id"])
+            desc = str(r.get("descricao") or "").strip()
+            cat = str(r.get("categoria") or "").strip()
+            valor = float(r.get("valor") or 0.0)
+            pagamento = str(r.get("pagamento") or "Débito Automático").strip() or "Débito Automático"
+            status = str(r.get("status") or "Pago").strip() or "Pago"
+            dia = int(r.get("dia") or 1)
+
+            inicio_ym = str(r.get("inicio_ym") or "").strip()
+            if not inicio_ym:
+                continue
+
+            intervalo_m = int(r.get("intervalo_m") or 1)
+            intervalo_m = max(1, min(24, intervalo_m))
+
+            fim_date = None
+            fim_ts = r.get("fim", None)
+            if pd.notna(fim_ts):
+                try:
+                    fim_date = pd.to_datetime(fim_ts).date()
+                except Exception:
+                    fim_date = None
+
+            fim_ym = str(r.get("fim_ym") or "").strip() or None
+            if fim_date is None and fim_ym:
+                try:
+                    fim_date = last_day_date_of_ym(fim_ym)
+                except Exception:
+                    fim_date = None
+
+            paused_from = str(r.get("paused_from_ym") or "").strip() or None
+            paused_until = str(r.get("paused_until_ym") or "").strip() or None
+
+            # começa no mês de início e segue até o horizonte (ou fim)
+            y0, m0 = parse_ym(inicio_ym)
+            d = date(y0, m0, 1)
+
             k = 0
             while d <= horizon_end:
                 ref = f"{d.year:04d}-{d.month:02d}"
-                dia = clamp_day_to_month(d.year, d.month, data_compra.day)
-                dt_lanc = date(d.year, d.month, dia)
 
-                if not _cc_transacao_exists(cc_id, None, ref):
-                    insert_transacao_extra(
-                        data=dt_lanc,
-                        descricao=f"{desc} (Recorrente)",
-                        categoria=cat,
-                        tipo="Despesa",
-                        valor=total,
-                        pagamento="Crédito",
-                        status="Pendente",
-                        origem="Cartão",
-                        cc_compra_id=cc_id,
-                        cc_parcela_num=None,
-                        cc_parcela_total=None,
-                        ref_month=ref,
-                    )
-                d = add_months(d, 1)
-                k += 1
-                if k > 500:
+                # pausa (pula meses dentro do intervalo pausado)
+                if paused_from and paused_until and (paused_from <= ref <= paused_until):
+                    d = add_months(d, intervalo_m)
+                    k += 1
+                    if k > 900:
+                        break
+                    continue
+
+                dia_clamped = clamp_day_to_month(d.year, d.month, dia)
+                dt_lanc = date(d.year, d.month, dia_clamped)
+
+                if fim_date is not None and dt_lanc > fim_date:
                     break
 
-        elif tipo_compra in {"avista", "parcelado"}:
-            parcelas = int(r["parcelas"]) if pd.notna(r["parcelas"]) else 1
-            parcelas = max(1, parcelas)
-            vals = split_installments(total, parcelas)
+                if not _fixo_transacao_exists(fixo_id, ref):
+                    with db_conn() as conn:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO transacoes (
+                                user_id,
+                                data, descricao, categoria, tipo, valor, pagamento, status,
+                                origem, ref_month, fixo_id
+                            )
+                            VALUES (?, ?, ?, ?, 'Despesa', ?, ?, ?, 'Débito Automático', ?, ?)
+                            """,
+                            (
+                                require_user_id(),
+                                pd.Timestamp(dt_lanc).strftime("%Y-%m-%d"),
+                                desc,
+                                cat,
+                                float(valor),
+                                pagamento,
+                                status,
+                                ref,
+                                int(fixo_id),
+                            ),
+                        )
 
-            for i in range(parcelas):
-                parc_num = i + 1
-                dt = add_months(data_compra, i)
-                ref = f"{dt.year:04d}-{dt.month:02d}"
+                d = add_months(d, intervalo_m)
+                k += 1
+                if k > 900:
+                    break
+        except Exception:
+            continue
 
-                if not _cc_transacao_exists(cc_id, parc_num, ref):
-                    sufixo = f" ({parc_num}/{parcelas})" if parcelas > 1 else ""
-                    insert_transacao_extra(
-                        data=dt,
-                        descricao=f"{desc}{sufixo}",
-                        categoria=cat,
-                        tipo="Despesa",
-                        valor=float(vals[i]),
-                        pagamento="Crédito",
-                        status="Pendente",
-                        origem="Cartão",
-                        cc_compra_id=cc_id,
-                        cc_parcela_num=parc_num,
-                        cc_parcela_total=parcelas,
-                        ref_month=ref,
-                    )
 
+
+
+def create_fixo_debito_automatico(
+    data_: date,
+    descricao: str,
+    categoria: str,
+    valor: float,
+    intervalo_m: int = 1,
+    fim: Optional[date] = None,
+) -> int:
+    """Cria regra fixa (Débito Automático) e registra o lançamento do mês."""
+    uid = require_user_id()
+    ref = month_key(pd.Timestamp(data_))
+    dia = int(data_.day)
+    intervalo_m = max(1, min(24, int(intervalo_m or 1)))
+
+    fim_ym = month_key(pd.Timestamp(fim)) if fim else None
+    fim_iso = pd.Timestamp(fim).strftime("%Y-%m-%d") if fim else None
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO lancamentos_fixos (
+                user_id, descricao, categoria, valor,
+                pagamento, status, dia, inicio_ym,
+                intervalo_m, fim_ym, fim,
+                ativo
+            )
+            VALUES (?, ?, ?, ?, 'Débito Automático', 'Pago', ?, ?, ?, ?, ?, 1)
+            """,
+            (uid, descricao.strip(), categoria.strip(), float(valor), dia, ref, intervalo_m, fim_ym, fim_iso),
+        )
+        fixo_id = int(cur.lastrowid)
+
+        # lançamento do mês de criação já entra na tabela transacoes com fixo_id
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO transacoes (
+                user_id,
+                data, descricao, categoria, tipo, valor, pagamento, status,
+                origem, ref_month, fixo_id
+            )
+            VALUES (?, ?, ?, ?, 'Despesa', ?, 'Débito Automático', 'Pago', 'Débito Automático', ?, ?)
+            """,
+            (uid, pd.Timestamp(data_).strftime("%Y-%m-%d"), descricao.strip(), categoria.strip(), float(valor), ref, fixo_id),
+        )
+
+    # Gera meses futuros para aparecer no Dashboard
+    ensure_fixos_generated(horizon_months=24)
+    return fixo_id
+
+
+
+
+def set_fixo_ativo(fixo_id: int, ativo: int, stop_after_ym: Optional[str] = None) -> int:
+    """Ativa/desativa um fixo. Se desativar, remove lançamentos futuros a partir do próximo mês."""
+    uid = require_user_id()
+    removed = 0
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if int(ativo) == 0:
+            stop_after_ym = (stop_after_ym or month_key(pd.Timestamp(date.today())))
+            next_ym = next_month_key(stop_after_ym)
+            fim_dt = last_day_date_of_ym(stop_after_ym)
+
+            # marca como inativo e define fim (mês atual do stop_after)
+            cur.execute(
+                """
+                UPDATE lancamentos_fixos
+                SET ativo = 0,
+                    fim_ym = ?,
+                    fim = ?,
+                    cancelado_em = CURRENT_TIMESTAMP,
+                    paused_from_ym = NULL,
+                    paused_until_ym = NULL
+                WHERE id = ? AND user_id = ?
+                """,
+                (stop_after_ym, pd.Timestamp(fim_dt).strftime("%Y-%m-%d"), int(fixo_id), uid),
+            )
+
+            # remove lançamentos futuros (próximo mês em diante)
+            cur.execute(
+                """
+                DELETE FROM transacoes
+                WHERE user_id = ?
+                  AND fixo_id = ?
+                  AND ref_month >= ?
+                """,
+                (uid, int(fixo_id), str(next_ym)),
+            )
+            removed = int(cur.rowcount)
+        else:
+            # reativar: limpa fim e gera novamente
+            cur.execute(
+                """
+                UPDATE lancamentos_fixos
+                SET ativo = 1,
+                    fim_ym = NULL,
+                    fim = NULL,
+                    paused_from_ym = NULL,
+                    paused_until_ym = NULL
+                WHERE id = ? AND user_id = ?
+                """,
+                (int(fixo_id), uid),
+            )
+
+    if int(ativo) == 1:
+        ensure_fixos_generated(horizon_months=24)
+
+    return removed
+
+
+
+def pause_fixo(fixo_id: int, pause_months: int, current_ym: str) -> Tuple[str, str, int]:
+    """Pausa um fixo por X meses (a partir do próximo mês do período atual) e remove lançamentos já gerados nesse intervalo."""
+    uid = require_user_id()
+    pause_months = max(1, int(pause_months))
+    start_ym = next_month_key(current_ym)
+
+    y, m = parse_ym(start_ym)
+    start_date = date(y, m, 1)
+    until_date = add_months(start_date, pause_months - 1)
+    until_ym = month_key(pd.Timestamp(until_date))
+
+    removed = 0
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE lancamentos_fixos
+            SET paused_from_ym = ?, paused_until_ym = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (start_ym, until_ym, int(fixo_id), uid),
+        )
+        cur.execute(
+            """
+            DELETE FROM transacoes
+            WHERE user_id = ?
+              AND fixo_id = ?
+              AND ref_month >= ?
+              AND ref_month <= ?
+            """,
+            (uid, int(fixo_id), start_ym, until_ym),
+        )
+        removed = int(cur.rowcount)
+
+    return start_ym, until_ym, removed
+
+
+def resume_fixo(fixo_id: int) -> None:
+    """Remove pausa e regenera meses futuros."""
+    uid = require_user_id()
+    with db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE lancamentos_fixos
+            SET paused_from_ym = NULL, paused_until_ym = NULL
+            WHERE id = ? AND user_id = ?
+            """,
+            (int(fixo_id), uid),
+        )
+    ensure_fixos_generated(horizon_months=24)
+
+
+def convert_transacao_to_fixo(
+    transacao_id: int,
+    intervalo_m: int = 1,
+    fim: Optional[date] = None,
+) -> int:
+    """Transforma uma despesa existente em conta fixa por Débito Automático."""
+    uid = require_user_id()
+    intervalo_m = max(1, min(24, int(intervalo_m or 1)))
+
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, data, descricao, categoria, tipo, valor, pagamento, origem, status
+            FROM transacoes
+            WHERE id = ? AND user_id = ?
+            """,
+            (int(transacao_id), uid),
+        ).fetchone()
+
+        if not row:
+            raise ValueError("Lançamento não encontrado.")
+        if str(row["tipo"]).strip().lower() != "despesa":
+            raise ValueError("Apenas despesas podem virar Débito Automático.")
+        if str(row.get("pagamento") or "").strip().lower() == "crédito":
+            raise ValueError("Compras no crédito devem ser geridas no Cartão de Crédito.")
+        if str(row.get("origem") or "").strip().lower() == "cartão":
+            raise ValueError("Compras do cartão devem ser geridas no Cartão de Crédito.")
+
+        dt = pd.to_datetime(row["data"]).date() if row["data"] else date.today()
+        descricao = str(row["descricao"] or "").strip() or "Despesa"
+        categoria = str(row["categoria"] or "").strip() or "Outros"
+        valor = float(row["valor"] or 0.0)
+
+    fixo_id = create_fixo_debito_automatico(
+        data_=dt,
+        descricao=descricao,
+        categoria=categoria,
+        valor=valor,
+        intervalo_m=intervalo_m,
+        fim=fim,
+    )
+
+    ref = month_key(pd.Timestamp(dt))
+    with db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE transacoes
+            SET pagamento = 'Débito Automático',
+                status = 'Pago',
+                origem = 'Débito Automático',
+                ref_month = ?,
+                fixo_id = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (ref, int(fixo_id), int(transacao_id), uid),
+        )
+
+    ensure_fixos_generated(horizon_months=24)
+    return int(fixo_id)
+
+def cancel_cc_recorrencia(cc_compra_id: int, stop_after_ym: str) -> int:
+    """Cancela recorrência do cartão para não aparecer nos próximos meses (remove pendentes futuros)."""
+    uid = require_user_id()
+    next_ym = next_month_key(stop_after_ym)
+    removed = 0
+    with db_conn() as conn:
+        cur = conn.cursor()
+        # desativa compra e marca fim (último dia do mês selecionado)
+        fim_dt = last_day_date_of_ym(stop_after_ym)
+        cur.execute(
+            "UPDATE cc_compras SET ativo = 0, fim = ? WHERE id = ? AND user_id = ?",
+            (pd.Timestamp(fim_dt).strftime("%Y-%m-%d"), int(cc_compra_id), uid),
+        )
+        # remove lançamentos pendentes futuros
+        cur.execute(
+            """
+            DELETE FROM transacoes
+            WHERE user_id = ?
+              AND cc_compra_id = ?
+              AND origem = 'Cartão'
+              AND pagamento = 'Crédito'
+              AND status = 'Pendente'
+              AND ref_month >= ?
+            """,
+            (uid, int(cc_compra_id), str(next_ym)),
+        )
+        removed = int(cur.rowcount)
+    return removed
 
 def amortizar_compra(
     cc_compra_id: int,
@@ -828,6 +1793,8 @@ def amortizar_compra(
     2) Cria uma transação 'Despesa' agora (pagamento adiantado) NÃO no 'Crédito'
     3) Registra em cc_amortizacoes
     """
+    uid = require_user_id()
+
     parcelas_amortizar = max(1, int(parcelas_amortizar))
     desconto = max(0.0, float(desconto))
 
@@ -836,14 +1803,15 @@ def amortizar_compra(
             """
             SELECT id, data, descricao, valor, cc_parcela_num, cc_parcela_total
             FROM transacoes
-            WHERE cc_compra_id = ?
+            WHERE user_id = ?
+              AND cc_compra_id = ?
               AND pagamento = 'Crédito'
               AND tipo = 'Despesa'
               AND status = 'Pendente'
             ORDER BY date(data) ASC
             """,
             conn,
-            params=(int(cc_compra_id),),
+            params=(uid, int(cc_compra_id)),
         )
 
     if df.empty:
@@ -858,7 +1826,10 @@ def amortizar_compra(
     valor_pago = round(valor_bruto - desconto, 2)
 
     with db_conn() as conn:
-        conn.executemany("UPDATE transacoes SET status = 'Amortizado' WHERE id = ?", [(int(i),) for i in amort_ids])
+        conn.executemany(
+            "UPDATE transacoes SET status = 'Amortizado' WHERE id = ? AND user_id = ?",
+            [(int(i), uid) for i in amort_ids],
+        )
 
     desc_base = str(take.iloc[0]["descricao"]) if not take.empty else "Compra no cartão"
     insert_transacao_extra(
@@ -889,24 +1860,6 @@ def amortizar_compra(
     return len(amort_ids), valor_pago
 
 
-# ============================================================
-# Investimentos
-# ============================================================
-
-INV_PRODUCTS_DEFAULT = [
-    "CDB",
-    "LCI/LCA",
-    "Tesouro Selic",
-    "Tesouro IPCA",
-    "Tesouro Prefixado",
-    "Fundo DI",
-    "Poupança",
-    "Outro (Renda Fixa)",
-]
-
-INV_MOV_TYPES = ["Aporte", "Retirada"]
-
-
 def _inv_signed_value(tipo: str, valor_abs: float) -> float:
     v = abs(float(valor_abs))
     return v if str(tipo).strip() == "Aporte" else -v
@@ -931,12 +1884,34 @@ def _sum_liquido(df: pd.DataFrame) -> float:
 
 
 def fetch_invest_config() -> Dict[str, float]:
+    uid = require_user_id()
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config WHERE id = 1"
+            "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config WHERE user_id = ?",
+            (uid,),
         ).fetchone()
+
+        if not row:
+            # cria defaults para este usuário copiando do legado (0)
+            row0 = conn.execute(
+                "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config WHERE user_id = ?",
+                (LEGACY_USER_ID,),
+            ).fetchone()
+            ap0 = float((row0["aporte_planejado"] if row0 else 0.0) or 0.0)
+            cdi0 = float((row0["cdi_anual"] if row0 else 0.0) or 0.0)
+            pct0 = float((row0["pct_cdi"] if row0 else 100.0) or 100.0)
+            conn.execute(
+                "INSERT OR IGNORE INTO investimentos_config (user_id, aporte_planejado, cdi_anual, pct_cdi) VALUES (?, ?, ?, ?)",
+                (uid, ap0, cdi0, pct0),
+            )
+            row = conn.execute(
+                "SELECT aporte_planejado, cdi_anual, pct_cdi FROM investimentos_config WHERE user_id = ?",
+                (uid,),
+            ).fetchone()
+
     if not row:
         return {"aporte_planejado": 0.0, "cdi_anual": 0.0, "pct_cdi": 100.0}
+
     return {
         "aporte_planejado": float(row["aporte_planejado"] or 0.0),
         "cdi_anual": float(row["cdi_anual"] or 0.0),
@@ -945,67 +1920,86 @@ def fetch_invest_config() -> Dict[str, float]:
 
 
 def upsert_invest_config(aporte_planejado: float, cdi_anual: float, pct_cdi: float) -> None:
+    uid = require_user_id()
     with db_conn() as conn:
         conn.execute(
             """
-            INSERT INTO investimentos_config (id, aporte_planejado, cdi_anual, pct_cdi)
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
+            INSERT INTO investimentos_config (user_id, aporte_planejado, cdi_anual, pct_cdi)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
                 aporte_planejado = excluded.aporte_planejado,
                 cdi_anual = excluded.cdi_anual,
                 pct_cdi = excluded.pct_cdi
             """,
-            (float(aporte_planejado), float(cdi_anual), float(pct_cdi)),
+            (uid, float(aporte_planejado), float(cdi_anual), float(pct_cdi)),
         )
 
 
 def fetch_invest_aportes() -> pd.DataFrame:
+    uid = require_user_id()
     with db_conn() as conn:
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
             df = pd.read_sql_query(
-                "SELECT id, data, produto, tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
+                """
+                SELECT id, data, produto, tipo, valor, observacao, created_at
+                FROM investimentos_aportes
+                WHERE user_id = ?
+                ORDER BY date(data) DESC, id DESC
+                """,
                 conn,
+                params=(uid,),
             )
         else:
             df = pd.read_sql_query(
-                "SELECT id, data, produto, 'Aporte' as tipo, valor, observacao FROM investimentos_aportes ORDER BY date(data) DESC, id DESC",
+                """
+                SELECT id, data, produto, valor, observacao, created_at
+                FROM investimentos_aportes
+                WHERE user_id = ?
+                ORDER BY date(data) DESC, id DESC
+                """,
                 conn,
+                params=(uid,),
             )
+            if not df.empty:
+                df["tipo"] = df["valor"].apply(lambda v: "Retirada" if safe_float(v) < 0 else "Aporte")
 
     if df.empty:
         return df
+
     df["data"] = pd.to_datetime(df["data"], errors="coerce")
-    df["produto"] = df["produto"].astype(str).fillna("Outro (Renda Fixa)")
-    df["tipo"] = df.get("tipo", "Aporte").astype(str).fillna("Aporte")
-    df["tipo"] = df["tipo"].apply(lambda x: x if x in INV_MOV_TYPES else "Aporte")
+    df["produto"] = df["produto"].astype(str).fillna("")
     df["observacao"] = df["observacao"].astype(str).fillna("")
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0).astype(float)
-    df = df.dropna(subset=["data"]).copy()
+    df["tipo"] = df["tipo"].astype(str).fillna("").replace("", "Aporte")
+    # normaliza tipo conforme lista
+    df["tipo"] = df["tipo"].apply(lambda t: t if t in INV_MOV_TYPES else ("Retirada" if t.lower().startswith("ret") else "Aporte"))
     return df
 
 
 def insert_invest_movimento(d: date, produto: str, tipo: str, valor_abs: float, observacao: str = "") -> None:
+    uid = require_user_id()
     data_str = pd.Timestamp(d).strftime("%Y-%m-%d")
     tipo = tipo if tipo in INV_MOV_TYPES else "Aporte"
     v_signed = _inv_signed_value(tipo, float(valor_abs))
+
     with db_conn() as conn:
         cols = _table_cols(conn, "investimentos_aportes")
         if "tipo" in cols:
             conn.execute(
                 """
-                INSERT INTO investimentos_aportes (data, produto, tipo, valor, observacao)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO investimentos_aportes (user_id, data, produto, tipo, valor, observacao)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (data_str, (produto or "").strip(), tipo, float(v_signed), (observacao or "").strip()),
+                (uid, data_str, str(produto or "").strip(), tipo, float(v_signed), str(observacao or "").strip()),
             )
         else:
             conn.execute(
                 """
-                INSERT INTO investimentos_aportes (data, produto, valor, observacao)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO investimentos_aportes (user_id, data, produto, valor, observacao)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (data_str, (produto or "").strip(), float(v_signed), (observacao or "").strip()),
+                (uid, data_str, str(produto or "").strip(), float(v_signed), str(observacao or "").strip()),
             )
 
 
@@ -1015,6 +2009,7 @@ def insert_invest_aporte(d: date, produto: str, valor: float, observacao: str = 
 
 
 def update_invest_movimento(row: Dict) -> None:
+    uid = require_user_id()
     tipo = row.get("tipo", "Aporte")
     tipo = tipo if tipo in INV_MOV_TYPES else "Aporte"
     valor_abs = safe_float(row.get("valor", 0.0))
@@ -1027,15 +2022,16 @@ def update_invest_movimento(row: Dict) -> None:
                 """
                 UPDATE investimentos_aportes
                 SET data = ?, produto = ?, tipo = ?, valor = ?, observacao = ?
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
                 (
                     row["data"],
-                    row["produto"],
+                    str(row.get("produto") or "").strip(),
                     tipo,
                     float(v_signed),
-                    row.get("observacao", "") or "",
+                    str(row.get("observacao") or "").strip(),
                     int(row["id"]),
+                    uid,
                 ),
             )
         else:
@@ -1043,14 +2039,15 @@ def update_invest_movimento(row: Dict) -> None:
                 """
                 UPDATE investimentos_aportes
                 SET data = ?, produto = ?, valor = ?, observacao = ?
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
                 (
                     row["data"],
-                    row["produto"],
+                    str(row.get("produto") or "").strip(),
                     float(v_signed),
-                    row.get("observacao", "") or "",
+                    str(row.get("observacao") or "").strip(),
                     int(row["id"]),
+                    uid,
                 ),
             )
 
@@ -1064,12 +2061,13 @@ def update_invest_aporte(row: Dict) -> None:
 
 
 def delete_invest_aportes(ids: Iterable[int]) -> int:
+    uid = require_user_id()
     ids = [int(i) for i in ids if str(i).strip().isdigit()]
     if not ids:
         return 0
     with db_conn() as conn:
         cur = conn.cursor()
-        cur.executemany("DELETE FROM investimentos_aportes WHERE id = ?", [(i,) for i in ids])
+        cur.executemany("DELETE FROM investimentos_aportes WHERE id = ? AND user_id = ?", [(i, uid) for i in ids])
         return cur.rowcount
 
 
@@ -1384,37 +2382,42 @@ def clamp_month_in_available(yyyy_mm: str, months: List[str]) -> str:
     return (same_year[-1] if same_year else months[-1])
 
 
-def compute_kpis(df_scope: pd.DataFrame, invest_aportes_scope: float) -> Dict[str, float]:
+def compute_kpis(df_scope: pd.DataFrame, invest_aportes_scope: float, invest_net_scope: float) -> Dict[str, float]:
     """
-    ✅ Regra importante:
-    - Investimentos NÃO entram como despesa e NÃO reduzem o Saldo.
-    - Investimentos aparecem em KPI separado (APORTES no escopo).
-    """
-    if df_scope.empty:
-        return {
-            "receitas": 0.0,
-            "despesas": 0.0,
-            "saldo": 0.0,
-            "economia_pct": 0.0,
-            "invest": float(invest_aportes_scope),
-        }
+    KPIs do período.
 
-    receitas = df_scope.loc[df_scope["tipo"] == "Receita", "valor"].sum()
-    despesas = df_scope.loc[df_scope["tipo"] == "Despesa", "valor"].sum()
-    saldo = receitas - despesas
-    economia_pct = (saldo / receitas * 100.0) if receitas > 0 else 0.0
+    Regras:
+    - "Investimentos (aportes)" continua sendo exibido separado (somente entradas para investimento).
+    - "Saldo" passa a representar o SALDO NO BANCO no período:
+        saldo_banco = receitas - despesas - invest_net_scope
+
+      Onde invest_net_scope é o valor líquido assinado dos movimentos em investimentos:
+        + aportes -> positivo (saída de caixa)
+        + retiradas -> negativo (entrada de caixa)
+
+    Isso faz com que o KPI "Saldo" reflita o caixa no banco (resultado operacional menos o líquido investido).
+    """
+    receitas = 0.0
+    despesas = 0.0
+
+    if not df_scope.empty:
+        receitas = float(df_scope.loc[df_scope["tipo"] == "Receita", "valor"].sum())
+        despesas = float(df_scope.loc[df_scope["tipo"] == "Despesa", "valor"].sum())
+
+    saldo_operacional = receitas - despesas
+    saldo_banco = saldo_operacional - float(invest_net_scope)
+
+    economia_pct = (saldo_banco / receitas * 100.0) if receitas > 0 else 0.0
+
     return {
         "receitas": float(receitas),
         "despesas": float(despesas),
-        "saldo": float(saldo),
+        "saldo": float(saldo_banco),                  # ✅ Saldo do banco
+        "saldo_operacional": float(saldo_operacional),
         "economia_pct": float(economia_pct),
-        "invest": float(invest_aportes_scope),
+        "invest": float(invest_aportes_scope),        # ✅ só aportes
+        "invest_net": float(invest_net_scope),        # líquido (debug/insight)
     }
-
-
-# ============================================================
-# Top bar (Ano + Mês separado + setas) + Visão Anual
-# ============================================================
 
 
 def _set_month_from_year_month(year: int, month: int):
@@ -1562,17 +2565,28 @@ def _scope_filters(
     year: int,
     mode: str,
     cutoff_day: int,
-) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, float, float]:
+    """
+    Retorna:
+      - df_scope
+      - inv_scope
+      - inv_aportes (somente aportes, sempre >= 0)  -> usado no KPI/Gráfico "Investimentos (aportes)"
+      - inv_net (líquido assinado: aportes positivos, retiradas negativas) -> usado no Saldo (Banco)
+
+    Nota:
+      - A tabela de investimentos pode armazenar valores já assinados (retirada negativa).
+      - Quando a tabela não tem coluna "tipo" (versões antigas), tudo é tratado como aporte.
+    """
     if scope == "month":
         df_scope = filter_df_by_period(df_all, "data", yyyy_mm, mode, cutoff_day)
         inv_scope = filter_df_by_period(inv_all, "data", yyyy_mm, mode, cutoff_day) if not inv_all.empty else inv_all
-        inv_aportes = _sum_aportes(inv_scope) if not inv_scope.empty else 0.0
-        return df_scope, inv_scope, float(inv_aportes)
+    else:
+        df_scope = filter_df_by_year(df_all, "data", year, mode, cutoff_day)
+        inv_scope = filter_df_by_year(inv_all, "data", year, mode, cutoff_day) if not inv_all.empty else inv_all
 
-    df_scope = filter_df_by_year(df_all, "data", year, mode, cutoff_day)
-    inv_scope = filter_df_by_year(inv_all, "data", year, mode, cutoff_day) if not inv_all.empty else inv_all
     inv_aportes = _sum_aportes(inv_scope) if not inv_scope.empty else 0.0
-    return df_scope, inv_scope, float(inv_aportes)
+    inv_net = _sum_liquido(inv_scope) if not inv_scope.empty else 0.0
+    return df_scope, inv_scope, float(inv_aportes), float(inv_net)
 
 
 def _pie_receita_despesa_invest(receitas: float, despesas: float, invest: float, title: str):
@@ -1594,9 +2608,9 @@ def _pie_receita_despesa_invest(receitas: float, despesas: float, invest: float,
 
 def screen_dashboard(df_all: pd.DataFrame, scope: str, yyyy_mm: str, year: int, mode: str, cutoff_day: int) -> None:
     inv_all = fetch_invest_aportes()
-    df_scope, inv_scope, inv_aportes_scope = _scope_filters(scope, df_all, inv_all, yyyy_mm, year, mode, cutoff_day)
+    df_scope, inv_scope, inv_aportes_scope, inv_net_scope = _scope_filters(scope, df_all, inv_all, yyyy_mm, year, mode, cutoff_day)
 
-    if df_scope.empty and inv_aportes_scope <= 0:
+    if df_scope.empty and abs(inv_net_scope) <= 0:
         st.info("Sem dados para este período")
         st.markdown(
             "<div class='panel'>Dica: vá em <b>Lançamentos</b>, <b>Cartão de Crédito</b> ou <b>Investimentos</b> e adicione seus dados.</div>",
@@ -1604,7 +2618,7 @@ def screen_dashboard(df_all: pd.DataFrame, scope: str, yyyy_mm: str, year: int, 
         )
         return
 
-    kpis = compute_kpis(df_scope, inv_aportes_scope)
+    kpis = compute_kpis(df_scope, inv_aportes_scope, inv_net_scope)
     label_scope = _period_label(scope, yyyy_mm, year)
 
     # KPIs
@@ -1614,7 +2628,7 @@ def screen_dashboard(df_all: pd.DataFrame, scope: str, yyyy_mm: str, year: int, 
 
     with c1:
         st.markdown(
-            "<div class='kpi'><div class='title'>Saldo</div><div class='value'>" + saldo_value + "</div>"
+            "<div class='kpi'><div class='title'>Saldo (Banco)</div><div class='value'>" + saldo_value + "</div>"
             f"<div class='hint'>{label_scope}</div></div>",
             unsafe_allow_html=True,
         )
@@ -1625,7 +2639,7 @@ def screen_dashboard(df_all: pd.DataFrame, scope: str, yyyy_mm: str, year: int, 
     with c4:
         kpi_card("Investimentos (aportes)", brl(kpis["invest"]), hint=label_scope)
     with c5:
-        hint = "(Saldo / Receitas)" if kpis["receitas"] > 0 else "Sem receitas"
+        hint = "(Saldo no banco / Receitas)" if kpis["receitas"] > 0 else "Sem receitas"
         kpi_card("Economia", f"{kpis['economia_pct']:.1f}%", hint=hint)
 
     st.write("")
@@ -1663,15 +2677,17 @@ def screen_dashboard(df_all: pd.DataFrame, scope: str, yyyy_mm: str, year: int, 
             invm = filter_df_by_period(inv_all, "data", mm, mode, cutoff_day) if not inv_all.empty else inv_all
             receitas = float(dfm.loc[dfm["tipo"] == "Receita", "valor"].sum()) if not dfm.empty else 0.0
             despesas = float(dfm.loc[dfm["tipo"] == "Despesa", "valor"].sum()) if not dfm.empty else 0.0
-            invest = float(_sum_aportes(invm)) if not invm.empty else 0.0
+            invest_aportes = float(_sum_aportes(invm)) if not invm.empty else 0.0
+            inv_net = float(_sum_liquido(invm)) if not invm.empty else 0.0
+            saldo_banco = (receitas - despesas) - inv_net
             rows.append(
                 {
                     "mes": mm,
                     "mes_label": PT_MONTHS[int(mm.split("-")[1])],
                     "receitas": receitas,
                     "despesas": despesas,
-                    "investimentos": invest,
-                    "saldo": receitas - despesas,
+                    "investimentos": invest_aportes,
+                    "saldo": saldo_banco,
                 }
             )
         ts = pd.DataFrame(rows)
@@ -1813,12 +2829,36 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                 valor = st.text_input("Valor (R$)", placeholder="Ex: 199,90")
             with c6:
                 pagamento = st.selectbox("Pagamento", pags)
-
             c7, c8 = st.columns([1, 2])
+            is_auto = (pagamento == "Débito Automático") and (tipo == "Despesa")
             with c7:
-                status = st.selectbox("Status", STATUS)
+                idx_pago = STATUS.index("Pago") if "Pago" in STATUS else 0
+                status = st.selectbox("Status", STATUS, index=(idx_pago if is_auto else 0), disabled=is_auto)
+                if is_auto:
+                    status = "Pago"
             with c8:
-                st.caption("Dica: parcelado/recorrente use **Cartão de Crédito**. Aportes/retiradas use **Investimentos**.")
+                if is_auto:
+                    st.caption("✅ **Débito Automático** será tratado como **conta fixa mensal** e entra como **Pago**. Você pode cancelar depois em 'Débito Automático (contas fixas)'.")
+                else:
+                    st.caption("Dica: parcelado/recorrente use **Cartão de Crédito**. Aportes/retiradas use **Investimentos**.")
+            # Opções avançadas para Débito Automático (fixo)
+            intervalo_m = 1
+            fim_dt_opt: Optional[date] = None
+            if is_auto:
+                st.write("")
+                cfa, cfb, cfc = st.columns([1.2, 1.2, 1.6])
+                with cfa:
+                    freq_label = st.selectbox("Frequência", ["Mensal", "Trimestral", "Anual"], index=0)
+                    intervalo_m = {"Mensal": 1, "Trimestral": 3, "Anual": 12}.get(freq_label, 1)
+                with cfb:
+                    use_fim = st.checkbox("Definir data de fim", value=False)
+                with cfc:
+                    if use_fim:
+                        fim_dt_opt = st.date_input("Data de fim", value=date.today())
+                        if fim_dt_opt and fim_dt_opt < d:
+                            st.warning("A data de fim está antes da data de início. Ajuste para evitar que o fixo não gere meses futuros.")
+                    else:
+                        st.caption("Sem data de fim (gera indefinidamente).")
 
             submitted = st.form_submit_button("Salvar lançamento")
 
@@ -1832,15 +2872,170 @@ def screen_lancamentos(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day
                     st.error("Valor deve ser maior que zero")
                 else:
                     try:
-                        insert_transacao(d, desc, str(categoria), tipo, valor_f, pagamento, status)
-                        st.success("Lançamento salvo!")
+                        if (pagamento == "Débito Automático") and (tipo == "Despesa"):
+                            create_fixo_debito_automatico(d, desc, str(categoria), float(valor_f), intervalo_m=intervalo_m, fim=fim_dt_opt)
+                            st.success("Conta fixa em Débito Automático criada! Próximos meses já foram gerados.")
+                        else:
+                            insert_transacao(d, desc, str(categoria), tipo, valor_f, pagamento, status)
+                            st.success("Lançamento salvo!")
+
                         st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao salvar: {e}")
 
     st.write("")
 
+
+    with st.expander("🔁 Débito Automático (contas fixas)", expanded=False):
+        fixos = fetch_fixos(include_inactive=True)
+        if fixos.empty:
+            st.info(
+                "Nenhuma conta fixa em Débito Automático cadastrada ainda. "
+                "Crie uma em 'Novo lançamento' escolhendo Pagamento = Débito Automático."
+            )
+        else:
+            show = fixos.copy()
+            show["ativo"] = show["ativo"].apply(lambda x: "Sim" if int(x) == 1 else "Não")
+            show["valor"] = show["valor"].apply(brl)
+            show["frequência"] = show["intervalo_m"].apply(lambda n: {1: "Mensal", 3: "Trimestral", 12: "Anual"}.get(int(n), f"{int(n)}m"))
+
+            st.dataframe(
+                show[
+                    [
+                        "id",
+                        "ativo",
+                        "descricao",
+                        "categoria",
+                        "valor",
+                        "dia",
+                        "inicio_ym",
+                        "frequência",
+                        "fim_ym",
+                        "paused_from_ym",
+                        "paused_until_ym",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            ids = show["id"].tolist()
+            c1, c2, c3 = st.columns([1.2, 1.4, 2])
+            with c1:
+                fixo_sel = st.selectbox("Selecionar fixo (ID)", ids, index=0, key="fixo_sel")
+
+            row = fixos[fixos["id"] == int(fixo_sel)].iloc[0]
+            ativo_now = int(row.get("ativo", 1))
+
+            with c2:
+                if ativo_now == 1:
+                    if st.button("⛔ Cancelar (parar a partir do próximo mês)", use_container_width=True, key=f"fixo_cancel_{fixo_sel}"):
+                        try:
+                            removed = set_fixo_ativo(int(fixo_sel), 0, stop_after_ym=yyyy_mm)
+                            st.success(f"Cancelado. Removidos {removed} lançamento(s) futuro(s).")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Falha ao cancelar: {e}")
+
+                    paused_from = str(row.get("paused_from_ym") or "").strip()
+                    paused_until = str(row.get("paused_until_ym") or "").strip()
+
+                    if paused_from and paused_until:
+                        st.info(f"⏸️ Pausado de **{paused_from}** até **{paused_until}**.")
+                        if st.button("▶️ Retomar (voltar a gerar)", use_container_width=True, key=f"fixo_resume_{fixo_sel}"):
+                            try:
+                                resume_fixo(int(fixo_sel))
+                                st.success("Pausa removida. Próximos meses foram gerados novamente.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Falha ao retomar: {e}")
+                    else:
+                        pm = st.number_input(
+                            "Pausar por quantos meses?",
+                            min_value=1,
+                            max_value=24,
+                            value=1,
+                            step=1,
+                            key=f"fixo_pause_m_{fixo_sel}",
+                        )
+                        if st.button("⏸️ Pausar", use_container_width=True, key=f"fixo_pause_btn_{fixo_sel}"):
+                            try:
+                                start_ym, until_ym, removed2 = pause_fixo(int(fixo_sel), int(pm), current_ym=yyyy_mm)
+                                st.success(
+                                    f"Pausado de {start_ym} até {until_ym}. "
+                                    f"Removidos {removed2} lançamento(s) já gerado(s) nesse intervalo."
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Falha ao pausar: {e}")
+                else:
+                    if st.button("✅ Reativar", use_container_width=True, key=f"fixo_reactivate_{fixo_sel}"):
+                        try:
+                            set_fixo_ativo(int(fixo_sel), 1)
+                            st.success("Reativado. Próximos meses foram gerados novamente.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Falha ao reativar: {e}")
+
+            with c3:
+                st.caption(
+                    "⚠️ **Cancelar** remove lançamentos **pendentes/futuros** a partir do **próximo mês** "
+                    "(o histórico do mês atual/anteriores fica). "
+                    "**Pausar** remove apenas por um intervalo e volta automaticamente depois (ou você pode retomar)."
+                )
+
+    with st.expander("🧲 Transformar despesa em Débito Automático", expanded=False):
+        st.caption(
+            "Pegue uma despesa já lançada e transforme em **conta fixa** (Débito Automático). "
+            "A partir daí, os próximos meses serão gerados automaticamente e você poderá pausar/cancelar."
+        )
+        cand = df_all.copy()
+        if not cand.empty:
+            cand["data"] = pd.to_datetime(cand["data"], errors="coerce")
+
+        if cand.empty:
+            st.info("Não há lançamentos disponíveis.")
+        else:
+            cand2 = cand[
+                (cand["tipo"] == "Despesa")
+                & (cand["pagamento"].astype(str).str.lower() != "crédito")
+                & (~cand.get("origem", "").astype(str).str.lower().eq("cartão"))
+            ].copy()
+
+            if cand2.empty:
+                st.info("Nenhuma despesa elegível para transformar (exclui cartão/crédito).")
+            else:
+                cand2 = cand2.sort_values("data", ascending=False).head(200)
+                cand2["label"] = cand2.apply(
+                    lambda rr: f"#{int(rr['id'])} — {rr['data'].date() if pd.notna(rr['data']) else ''} — {str(rr['descricao'])[:40]} — {brl(rr['valor'])}",
+                    axis=1,
+                )
+                sel = st.selectbox("Selecione a despesa", cand2["label"].tolist(), index=0, key="conv_sel")
+                tid = int(cand2[cand2["label"] == sel].iloc[0]["id"])
+
+                cta, ctb, ctc = st.columns([1.2, 1.2, 1.6])
+                with cta:
+                    freq_label2 = st.selectbox("Frequência (fixo)", ["Mensal", "Trimestral", "Anual"], index=0, key="conv_freq")
+                    intervalo_m2 = {"Mensal": 1, "Trimestral": 3, "Anual": 12}.get(freq_label2, 1)
+                with ctb:
+                    use_fim2 = st.checkbox("Definir data de fim", value=False, key="conv_usefim")
+                with ctc:
+                    fim2 = None
+                    if use_fim2:
+                        fim2 = st.date_input("Data de fim", value=date.today(), key="conv_fim")
+                    else:
+                        st.caption("Sem data de fim.")
+
+                if st.button("✅ Transformar em Débito Automático", use_container_width=True, key="conv_btn"):
+                    try:
+                        new_id = convert_transacao_to_fixo(tid, intervalo_m=int(intervalo_m2), fim=fim2)
+                        st.success(f"Transformado com sucesso! Fixo criado (ID {new_id}).")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha ao transformar: {e}")
+
     f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
+
 
     df = df_all.copy()
     df["data"] = pd.to_datetime(df["data"], errors="coerce")
@@ -2135,15 +3330,31 @@ def screen_cartao(df_all: pd.DataFrame, yyyy_mm: str, mode: str, cutoff_day: int
         with c_act2:
             row_sel = compras[compras["id"] == int(id_sel)].iloc[0]
             ativo_now = int(row_sel.get("ativo", 1))
-            if st.button("⛔ Desativar" if ativo_now == 1 else "✅ Reativar", use_container_width=True):
+            tipo_sel = str(row_sel.get("tipo_compra", "")).lower()
+
+            label_btn = "⛔ Desativar" if ativo_now == 1 else "✅ Reativar"
+            if st.button(label_btn, use_container_width=True):
                 try:
-                    set_cc_compra_ativo(int(id_sel), 0 if ativo_now == 1 else 1)
-                    st.success("Atualizado.")
+                    if ativo_now == 1:
+                        # Desativa a compra (para evitar novas gerações)
+                        set_cc_compra_ativo(int(id_sel), 0)
+
+                        # Para recorrente: remove lançamentos futuros pendentes para não aparecer nos próximos meses
+                        if tipo_sel == "recorrente":
+                            removed = cancel_cc_recorrencia(int(id_sel), stop_after_ym=yyyy_mm)
+                            st.success(f"Recorrência cancelada. Removidos {removed} lançamento(s) futuro(s).")
+                        else:
+                            st.success("Compra desativada.")
+                    else:
+                        set_cc_compra_ativo(int(id_sel), 1)
+                        ensure_cc_generated(horizon_months=24)
+                        st.success("Reativado. Próximos meses foram gerados novamente.")
+
                     st.rerun()
                 except Exception as e:
                     st.error(f"Falha: {e}")
         with c_act3:
-            st.caption("Desativar não apaga histórico: só para de gerar novas recorrências (as já geradas continuam).")
+            st.caption("Desativar não apaga histórico. Para **Recorrente**, remove os lançamentos **futuros pendentes** para não aparecer nos próximos meses. Para parcelado/à vista, apenas para a geração futura (se houver).")
 
     st.write("")
     st.markdown("#### Amortizar (adiantar) parcelas do cartão")
@@ -2769,15 +3980,69 @@ def screen_investimentos(yyyy_mm: str, mode: str, cutoff_day: int) -> None:
 # ============================================================
 
 
+def screen_admin() -> None:
+    if not is_admin():
+        st.error("Acesso restrito ao ADMIN.")
+        return
+
+    st.markdown("## 👥 Admin — Usuários")
+
+    with st.expander("➕ Criar novo usuário", expanded=True):
+        with st.form("admin_create_user"):
+            username = st.text_input("Username (login)", placeholder="ex: maria")
+            display_name = st.text_input("Nome exibido", placeholder="ex: Maria")
+            password = st.text_input("Senha", type="password")
+            password2 = st.text_input("Confirmar senha", type="password")
+            make_admin = st.checkbox("Tornar este usuário ADMIN", value=False)
+            submitted = st.form_submit_button("Criar usuário")
+
+        if submitted:
+            if not username.strip():
+                st.error("Preencha o username.")
+                return
+            if not password:
+                st.error("Preencha a senha.")
+                return
+            if password != password2:
+                st.error("As senhas não conferem.")
+                return
+            try:
+                create_user(username=username, display_name=display_name, password=password, admin=bool(make_admin))
+                st.success("Usuário criado com sucesso.")
+            except sqlite3.IntegrityError:
+                st.error("Este username já existe.")
+            except Exception as e:
+                st.error(f"Falha ao criar usuário: {e}")
+
+    st.divider()
+    st.markdown("### Usuários cadastrados")
+    with db_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT id, username, display_name, is_admin, created_at FROM users ORDER BY id ASC",
+            conn,
+        )
+    if df.empty:
+        st.info("Nenhum usuário cadastrado.")
+        return
+    df["is_admin"] = df["is_admin"].apply(lambda x: "Sim" if int(x or 0) == 1 else "Não")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="💰")
     st.markdown(CSS, unsafe_allow_html=True)
 
     init_db()
-    generate_mock_data()
     ensure_state()
 
-    # carrega config persistida 1x por sessão
+    # ---------- Login ----------
+    if not auth_gate():
+        return
+
+    # garante config/seed do usuário
+    ensure_user_defaults(require_user_id())
+
+    # carrega config persistida 1x por sessão (por usuário)
     if not st.session_state._period_cfg_loaded:
         app_cfg = fetch_app_config()
         st.session_state.analysis_mode = app_cfg["budget_mode"]
@@ -2787,10 +4052,19 @@ def main():
     mode = st.session_state.analysis_mode
     cutoff_day = int(st.session_state.budget_cutoff_day)
 
+    # Gera/atualiza parcelas futuras do cartão para ESTE usuário
     ensure_cc_generated(horizon_months=24)
+    # Gera/atualiza lançamentos fixos (Débito Automático) para ESTE usuário
+    ensure_fixos_generated(horizon_months=24)
 
+    # ---------- Sidebar ----------
     with st.sidebar:
         st.markdown("### 💼 Finanças")
+        st.caption(f"Logado como: **{st.session_state.get('display_name','')}**")
+        cols = st.columns([1, 1])
+        with cols[1]:
+            if st.button("Sair", use_container_width=True):
+                logout()
 
         with st.expander("🧾 Período / mês de orçamento", expanded=False):
             opt = st.radio(
@@ -2812,10 +4086,16 @@ def main():
                 st.success("Período salvo!")
                 st.rerun()
 
+        pages = ["Dashboard", "Lançamentos", "Cartão de Crédito", "Planejamento", "Investimentos"]
+        icons = ["speedometer2", "list-check", "credit-card", "bullseye", "graph-up-arrow"]
+        if is_admin():
+            pages.append("Admin")
+            icons.append("people")
+
         selected = option_menu(
             None,
-            ["Dashboard", "Lançamentos", "Cartão de Crédito", "Planejamento", "Investimentos"],
-            icons=["speedometer2", "list-check", "credit-card", "bullseye", "graph-up-arrow"],
+            pages,
+            icons=icons,
             menu_icon="wallet2",
             default_index=0,
             styles={
@@ -2828,6 +4108,7 @@ def main():
         st.markdown("---")
         st.caption("Dados locais em SQLite (financas.db)")
 
+    # ---------- Dados ----------
     df_all = fetch_transacoes()
     inv_all = fetch_invest_aportes()
 
@@ -2835,6 +4116,7 @@ def main():
     st.session_state["_months_list"] = months
     scope, yyyy_mm, year = top_bar(months, mode, cutoff_day)
 
+    # ---------- Rotas ----------
     if selected == "Dashboard":
         screen_dashboard(df_all, scope=scope, yyyy_mm=yyyy_mm, year=year, mode=mode, cutoff_day=cutoff_day)
     elif selected == "Lançamentos":
@@ -2845,7 +4127,10 @@ def main():
         screen_planejamento(df_all, yyyy_mm, mode, cutoff_day)
     elif selected == "Investimentos":
         screen_investimentos(yyyy_mm, mode, cutoff_day)
+    elif selected == "Admin":
+        screen_admin()
 
 
 if __name__ == "__main__":
     main()
+
